@@ -1,0 +1,12 @@
+# build output
+/tgca
+*.exe
+
+# local archive data (never commit downloaded media or state)
+/archives/
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
