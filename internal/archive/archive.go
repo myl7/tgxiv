@@ -12,10 +12,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/myl7/tg-channel-archive/internal/exportjson"
-	"github.com/myl7/tg-channel-archive/internal/media"
-	"github.com/myl7/tg-channel-archive/internal/store"
-	"github.com/myl7/tg-channel-archive/internal/tdlx"
+	"github.com/myl7/tgxiv/internal/exportjson"
+	"github.com/myl7/tgxiv/internal/media"
+	"github.com/myl7/tgxiv/internal/store"
+	"github.com/myl7/tgxiv/internal/tdlx"
 )
 
 // Config is the archive's static configuration.

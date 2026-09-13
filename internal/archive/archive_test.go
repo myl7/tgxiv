@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/myl7/tg-channel-archive/internal/store"
-	"github.com/myl7/tg-channel-archive/internal/tdlx"
+	"github.com/myl7/tgxiv/internal/store"
+	"github.com/myl7/tgxiv/internal/tdlx"
 )
 
 // fakeRunner stands in for the tdl binary. On Download it reads the batch file

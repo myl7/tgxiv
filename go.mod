@@ -1,4 +1,4 @@
-module github.com/myl7/tg-channel-archive
+module github.com/myl7/tgxiv
 
 go 1.26.5
 

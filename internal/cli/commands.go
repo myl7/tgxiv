@@ -6,8 +6,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/myl7/tg-channel-archive/internal/archive"
-	"github.com/myl7/tg-channel-archive/internal/store"
+	"github.com/myl7/tgxiv/internal/archive"
+	"github.com/myl7/tgxiv/internal/store"
 )
 
 // download tunables, shared by download and sync
@@ -44,7 +44,7 @@ func newExportCmd() *cobra.Command {
 			defer func() { _ = a.Close() }()
 
 			if a.Chat() == "" {
-				return fmt.Errorf("channel is required (--chat or TGCA_CHAT)")
+				return fmt.Errorf("channel is required (--chat or TGXIV_CHAT)")
 			}
 
 			ctx, cancel := signalContext()
@@ -146,7 +146,7 @@ func exportThenDownload(f *dlFlags, incremental bool) error {
 	defer func() { _ = a.Close() }()
 
 	if a.Chat() == "" {
-		return fmt.Errorf("channel is required (--chat or TGCA_CHAT)")
+		return fmt.Errorf("channel is required (--chat or TGXIV_CHAT)")
 	}
 
 	ctx, cancel := signalContext()

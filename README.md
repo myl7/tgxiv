@@ -1,11 +1,11 @@
 <div align="center">
 
-# tgca
+# tgxiv
 
 ### Archive a Telegram channel. Smallest media first, size-verified, resumable.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.24%2B-00ADD8.svg)](https://go.dev)
+[![Go](https://img.shields.io/badge/go-1.26%2B-00ADD8.svg)](https://go.dev)
 [![Engine](https://img.shields.io/badge/engine-tdl-2CA5E0.svg)](https://github.com/iyear/tdl)
 [![Storage](https://img.shields.io/badge/state-SQLite-003B57.svg)](https://sqlite.org)
 
@@ -22,15 +22,15 @@ where it stopped. Run `update` later and it fetches only what is new.
 
 Downloading a whole channel sounds simple until you actually do it. Files arrive
 out of order, a dropped connection leaves half-written garbage, a rerun starts
-from scratch, and you never quite know whether every file made it. `tgca` turns
+from scratch, and you never quite know whether every file made it. `tgxiv` turns
 that into a boring, repeatable operation.
 
 Three facts about tdl shaped the design:
 
 - Stock `tdl dl` re-sorts messages by id, so it cannot download by size on its
-  own. This project adds a `--keep-order` flag to the tdl engine and lets `tgca`
+  own. This project adds a `--keep-order` flag to the tdl engine and lets `tgxiv`
   drive the order instead.
-- A media file's true byte size lives only in the raw export, so `tgca` reads it
+- A media file's true byte size lives only in the raw export, so `tgxiv` reads it
   straight from there, using the exact rule tdl uses. Ordering and verification
   agree with what actually gets downloaded.
 - tdl names files `<channelID>_<messageID>_<name>`, so any finished download can
@@ -80,7 +80,7 @@ flowchart LR
 
 ## Requirements
 
-- **Go 1.24+** to build.
+- **Go 1.26+** to build.
 - A **`tdl` binary built with the `--keep-order` patch**, logged in to an account
   that can read the channel. Check with `tdl dl --help | grep keep-order`.
 
@@ -90,8 +90,8 @@ flowchart LR
 # build the tdl engine (fork with --keep-order) and put it on PATH
 git clone https://github.com/myl7/tdl && (cd tdl && go build -o ~/go/bin/tdl .)
 
-# build tgca
-git clone https://github.com/myl7/tg-channel-archive && (cd tg-channel-archive && go build -o ~/go/bin/tgca .)
+# build tgxiv
+git clone https://github.com/myl7/tgxiv && (cd tgxiv && go build -o ~/go/bin/tgxiv .)
 
 # log in once (default namespace)
 tdl login
@@ -101,26 +101,28 @@ tdl login
 
 ```sh
 # first archive: full export, then download smallest-first
-tgca -d ~/archives/mychannel -c mychannel sync
+tgxiv -d ~/archives/mychannel -c mychannel sync
 
 # later: pull only what is new
-tgca -d ~/archives/mychannel -c mychannel update
+tgxiv -d ~/archives/mychannel -c mychannel update
 
 # check progress and any failures
-tgca -d ~/archives/mychannel status
+tgxiv -d ~/archives/mychannel status
 ```
 
 Configuration comes from flags or environment variables:
 
-| flag         | env         | meaning                                    |
-|--------------|-------------|--------------------------------------------|
-| `--dir, -d`  | `TGCA_DIR`  | archive directory (required)               |
-| `--chat, -c` | `TGCA_CHAT` | channel username, id, or link (for export) |
-| `--ns, -n`   | `TGCA_NS`   | tdl session namespace (default `default`)  |
-| `--tdl`      | `TGCA_TDL`  | tdl executable (default `tdl`)             |
+| flag         | env          | meaning                                    |
+|--------------|--------------|--------------------------------------------|
+| `--dir, -d`  | `TGXIV_DIR`  | archive directory (required)               |
+| `--chat, -c` | `TGXIV_CHAT` | channel username, id, or link (for export) |
+| `--ns, -n`   | `TGXIV_NS`   | tdl session namespace (default `default`)  |
+| `--tdl`      | `TGXIV_TDL`  | tdl executable (default `tdl`)             |
+
+Legacy `TGCA_*` env vars are still honored as fallback.
 
 > The `--ns` must match the namespace you logged in with. A plain `tdl login`
-> uses `default`, which is also tgca's default.
+> uses `default`, which is also tgxiv's default.
 
 ## Commands
 
@@ -137,7 +139,7 @@ Configuration comes from flags or environment variables:
 Download tunables (on `sync`, `update`, `download`):
 
 ```sh
-tgca -d DIR download \
+tgxiv -d DIR download \
   --batch 100 \   # messages per tdl dl call; 1 = one message per call
   --attempts 3 \  # size-verify retries per message before "failed"
   --threads 4 \   # passed to tdl --threads
@@ -164,7 +166,7 @@ archived id is out of scope.
 
 ## Interruption and resume
 
-Press Ctrl-C at any time. `tgca` forwards SIGINT to tdl so it can stop cleanly.
+Press Ctrl-C at any time. `tgxiv` forwards SIGINT to tdl so it can stop cleanly.
 On the next run:
 
 - The state DB still knows which messages are `done`, so they are not re-listed.
@@ -184,9 +186,9 @@ On the next run:
 
 ## Notes and limits
 
-- Run one `tgca` per archive directory at a time. Multiple tdl processes on the
+- Run one `tgxiv` per archive directory at a time. Multiple tdl processes on the
   same namespace are safe (the session DB is opened per operation), but two
-  `tgca` on one archive dir would race the state DB and the batch file.
+  `tgxiv` on one archive dir would race the state DB and the batch file.
 - Photo sizes are taken from the largest reported size, matching tdl. Documents
   verify exactly. If a provider reports a size that differs from the delivered
   bytes, that message exhausts its attempts and lands in `failed`.

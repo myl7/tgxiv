@@ -1,5 +1,5 @@
 # build output
-/tgca
+/tgxiv
 *.exe
 
 # local archive data (never commit downloaded media or state)

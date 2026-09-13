@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/myl7/tg-channel-archive/internal/archive"
+	"github.com/myl7/tgxiv/internal/archive"
 )
 
 // shared flags, resolved in PersistentPreRun with env fallbacks
@@ -21,13 +21,16 @@ var (
 	flagChat      string
 )
 
-// envOr returns the flag value if non-empty, else the env var, else def.
-func envOr(flagVal, env, def string) string {
+// envOr returns the flag value if non-empty, else the first non-empty env var
+// in envs (TGXIV_* before legacy TGCA_*), else def.
+func envOr(flagVal string, envs []string, def string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	if v := os.Getenv(env); v != "" {
-		return v
+	for _, env := range envs {
+		if v := os.Getenv(env); v != "" {
+			return v
+		}
 	}
 	return def
 }
@@ -35,16 +38,16 @@ func envOr(flagVal, env, def string) string {
 // NewRoot builds the root command tree.
 func NewRoot() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "tgca",
+		Use:           "tgxiv",
 		Short:         "Archive a Telegram channel with tdl: export the manifest, then download media smallest-first with size verification and resume.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
 
-	root.PersistentFlags().StringVarP(&flagDir, "dir", "d", "", "archive directory (env TGCA_DIR)")
-	root.PersistentFlags().StringVarP(&flagNamespace, "ns", "n", "", "tdl session namespace (env TGCA_NS, default \"default\")")
-	root.PersistentFlags().StringVar(&flagTdlBin, "tdl", "", "tdl executable (env TGCA_TDL, default \"tdl\")")
-	root.PersistentFlags().StringVarP(&flagChat, "chat", "c", "", "channel username, id, or link (env TGCA_CHAT)")
+	root.PersistentFlags().StringVarP(&flagDir, "dir", "d", "", "archive directory (env TGXIV_DIR)")
+	root.PersistentFlags().StringVarP(&flagNamespace, "ns", "n", "", "tdl session namespace (env TGXIV_NS, default \"default\")")
+	root.PersistentFlags().StringVar(&flagTdlBin, "tdl", "", "tdl executable (env TGXIV_TDL, default \"tdl\")")
+	root.PersistentFlags().StringVarP(&flagChat, "chat", "c", "", "channel username, id, or link (env TGXIV_CHAT)")
 
 	root.AddCommand(
 		newExportCmd(),
@@ -60,15 +63,15 @@ func NewRoot() *cobra.Command {
 
 // baseConfig assembles the parts of archive.Config that come from shared flags.
 func baseConfig() (archive.Config, error) {
-	dir := envOr(flagDir, "TGCA_DIR", "")
+	dir := envOr(flagDir, []string{"TGXIV_DIR", "TGCA_DIR"}, "")
 	if dir == "" {
-		return archive.Config{}, fmt.Errorf("archive directory is required (--dir or TGCA_DIR)")
+		return archive.Config{}, fmt.Errorf("archive directory is required (--dir or TGXIV_DIR)")
 	}
 	return archive.Config{
 		Dir:       dir,
-		Chat:      envOr(flagChat, "TGCA_CHAT", ""),
-		Namespace: envOr(flagNamespace, "TGCA_NS", "default"),
-		TdlBin:    envOr(flagTdlBin, "TGCA_TDL", "tdl"),
+		Chat:      envOr(flagChat, []string{"TGXIV_CHAT", "TGCA_CHAT"}, ""),
+		Namespace: envOr(flagNamespace, []string{"TGXIV_NS", "TGCA_NS"}, "default"),
+		TdlBin:    envOr(flagTdlBin, []string{"TGXIV_TDL", "TGCA_TDL"}, "tdl"),
 	}, nil
 }
 

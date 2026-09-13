@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/myl7/tg-channel-archive/internal/archive"
+	"github.com/myl7/tgxiv/internal/archive"
 )
 
 // writeFailedReport writes the current list of permanently failed messages to a

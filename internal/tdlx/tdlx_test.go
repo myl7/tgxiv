@@ -15,11 +15,11 @@ func TestRunCapturesStdout(t *testing.T) {
 	var buf bytes.Buffer
 	r := &Runner{Bin: "/bin/echo", Namespace: "default", Stdout: &buf}
 
-	if err := r.run(context.Background(), []string{"hello-tgca"}); err != nil {
+	if err := r.run(context.Background(), []string{"hello-tgxiv"}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	// run prepends "-n default", so echo prints: -n default hello-tgca
-	if got := buf.String(); !strings.Contains(got, "hello-tgca") {
+	// run prepends "-n default", so echo prints: -n default hello-tgxiv
+	if got := buf.String(); !strings.Contains(got, "hello-tgxiv") {
 		t.Fatalf("stdout not captured, got %q", got)
 	}
 }

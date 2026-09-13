@@ -1,11 +1,11 @@
-// Command tgca archives a Telegram channel using tdl as the download engine.
+// Command tgxiv archives a Telegram channel using tdl as the download engine.
 package main
 
 import (
 	"fmt"
 	"os"
 
-	"github.com/myl7/tg-channel-archive/internal/cli"
+	"github.com/myl7/tgxiv/internal/cli"
 )
 
 func main() {
