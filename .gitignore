@@ -1,5 +1,6 @@
 # build output
 /tgxiv
+/bin/
 *.exe
 
 # local archive data (never commit downloaded media or state)
@@ -10,3 +11,7 @@
 
 # OS
 .DS_Store
+
+# web (Next.js)
+web/node_modules/
+web/.next/

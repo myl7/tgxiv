@@ -9,9 +9,9 @@ import (
 const sample = `{
   "id": 1234567890,
   "messages": [
-    {"id": 10, "type": "message", "file": "a.mp4", "date": 1700000000,
+    {"id": 10, "type": "message", "file": "a.mp4", "date": 1700000000, "text": "with media",
      "raw": {"ID": 10, "Media": {"Document": {"ID": 1, "Size": 100}}}},
-    {"id": 11, "type": "message", "file": "", "date": 1700000100,
+    {"id": 11, "type": "message", "file": "", "date": 1700000100, "text": "text only",
      "raw": {"ID": 11, "Message": "text only", "Media": null}},
     {"id": 12, "type": "service", "file": "", "date": 1700000200,
      "raw": {"ID": 12}},
@@ -38,8 +38,18 @@ func TestParse(t *testing.T) {
 	if got[0].ID != 10 || got[0].File != "a.mp4" || got[0].Date != 1700000000 {
 		t.Errorf("msg0 = %+v", got[0])
 	}
+	if got[0].Text != "with media" {
+		t.Errorf("msg0 text = %q, want %q", got[0].Text, "with media")
+	}
 	if len(got[0].Raw) == 0 {
 		t.Error("msg0 raw should be captured")
+	}
+	if got[1].Text != "text only" {
+		t.Errorf("msg1 text = %q, want %q", got[1].Text, "text only")
+	}
+	// tdl omits empty text (omitempty), so service messages decode to ""
+	if got[2].Text != "" {
+		t.Errorf("msg2 text = %q, want empty", got[2].Text)
 	}
 	if got[3].ID != 13 || got[3].Type != "message" {
 		t.Errorf("msg3 = %+v", got[3])

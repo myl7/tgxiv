@@ -82,6 +82,45 @@ func newImportCmd() *cobra.Command {
 	}
 }
 
+func newMigrateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "migrate",
+		Short: "Backfill message content in archive.db from kept export JSON snapshots (one-time migration from the JSON era)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, err := openArchive(nil)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = a.Close() }()
+
+			files, err := a.ReplayExports()
+			if err != nil {
+				return err
+			}
+			if files == 0 {
+				fmt.Println("[archive] no export snapshots to replay (this is fine for new archives)")
+				return nil
+			}
+			fmt.Printf("[archive] replayed %d export snapshot(s)\n", files)
+
+			msgs, err := a.Store().MessageCount()
+			if err != nil {
+				return err
+			}
+			counts, err := a.Store().Counts()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("content: %d message(s)\n", msgs)
+			fmt.Printf("total:   %d\n", counts["total"])
+			fmt.Printf("done:    %d\n", counts[store.StatusDone])
+			fmt.Printf("pending: %d\n", counts[store.StatusPending])
+			fmt.Printf("failed:  %d\n", counts[store.StatusFailed])
+			return nil
+		},
+	}
+}
+
 func newDownloadCmd() *cobra.Command {
 	var f dlFlags
 	cmd := &cobra.Command{

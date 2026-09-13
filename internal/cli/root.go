@@ -17,8 +17,8 @@ import (
 var (
 	flagDir       string
 	flagNamespace string
-	flagTdlBin    string
 	flagChat      string
+	flagTdl       string
 )
 
 // envOr returns the flag value if non-empty, else the first non-empty env var
@@ -46,16 +46,18 @@ func NewRoot() *cobra.Command {
 
 	root.PersistentFlags().StringVarP(&flagDir, "dir", "d", "", "archive directory (env TGXIV_DIR)")
 	root.PersistentFlags().StringVarP(&flagNamespace, "ns", "n", "", "tdl session namespace (env TGXIV_NS, default \"default\")")
-	root.PersistentFlags().StringVar(&flagTdlBin, "tdl", "", "tdl executable (env TGXIV_TDL, default \"tdl\")")
 	root.PersistentFlags().StringVarP(&flagChat, "chat", "c", "", "channel username, id, or link (env TGXIV_CHAT)")
+	root.PersistentFlags().StringVar(&flagTdl, "tdl", "", "tdl executable (env TGXIV_TDL, default \"tdl\")")
 
 	root.AddCommand(
+		newLoginCmd(),
 		newExportCmd(),
 		newDownloadCmd(),
 		newSyncCmd(),
 		newUpdateCmd(),
 		newStatusCmd(),
 		newImportCmd(),
+		newMigrateCmd(),
 		newResetFailedCmd(),
 	)
 	return root
@@ -71,7 +73,7 @@ func baseConfig() (archive.Config, error) {
 		Dir:       dir,
 		Chat:      envOr(flagChat, []string{"TGXIV_CHAT", "TGCA_CHAT"}, ""),
 		Namespace: envOr(flagNamespace, []string{"TGXIV_NS", "TGCA_NS"}, "default"),
-		TdlBin:    envOr(flagTdlBin, []string{"TGXIV_TDL", "TGCA_TDL"}, "tdl"),
+		TdlBin:    envOr(flagTdl, []string{"TGXIV_TDL"}, "tdl"),
 	}, nil
 }
 

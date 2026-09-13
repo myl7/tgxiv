@@ -84,6 +84,15 @@ func (r *Runner) Download(ctx context.Context, o DownloadOptions) error {
 	return r.run(ctx, args)
 }
 
+// Login runs "tdl login" interactively (QR by default, or -T code).
+func (r *Runner) Login(ctx context.Context, code bool) error {
+	mode := "qr"
+	if code {
+		mode = "code"
+	}
+	return r.run(ctx, []string{"login", "-T", mode})
+}
+
 func (r *Runner) run(ctx context.Context, args []string) error {
 	// namespace is a persistent flag, valid before the subcommand
 	full := append([]string{"-n", r.Namespace}, args...)

@@ -5,8 +5,9 @@
 //	{"id": <channelID>, "messages": [ {message}, {message}, ... ]}
 //
 // The messages array can be huge, so it is decoded element by element instead
-// of loaded whole. Each message keeps its "raw" object verbatim for later media
-// extraction.
+// of loaded whole. Each message carries its text and keeps its "raw" object
+// verbatim, so the DB can archive the full content and media extraction can
+// run later.
 package exportjson
 
 import (
@@ -16,14 +17,14 @@ import (
 	"os"
 )
 
-// Message is the subset of a tdl-exported message the archiver needs. Text
-// content is intentionally omitted: it already lives in the export file, which
-// is the text archive.
+// Message is the subset of a tdl-exported message the archiver needs. Text is
+// included because the DB, not the export file, is the text archive.
 type Message struct {
 	ID   int             `json:"id"`
 	Type string          `json:"type"`
 	File string          `json:"file"`
 	Date int             `json:"date"`
+	Text string          `json:"text"`
 	Raw  json.RawMessage `json:"raw"`
 }
 
