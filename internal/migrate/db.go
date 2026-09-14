@@ -58,12 +58,11 @@ renamed out; archive.db stays behind as the safety backup.`,
 		},
 	}
 	f := cmd.Flags()
-	f.Int64Var(&opts.ChatID, "chat-id", 0, "bare Telegram dialog id the old archive belongs to (required, positive)")
+	f.Int64Var(&opts.ChatID, "chat-id", 0, "bare Telegram dialog id the old archive belongs to (default: derived from the archive)")
 	f.StringVar(&opts.Username, "username", "", "dialog username, stored without a leading '@' (optional)")
 	f.StringVar(&opts.Title, "title", "", "dialog title (optional)")
 	f.StringVar(&opts.Kind, "kind", "", "dialog kind: channel | group | private (stored leniently; optional)")
 	f.BoolVar(&opts.Force, "force", false, "allow re-running when the dialog already exists in this archive")
-	_ = cmd.MarkFlagRequired("chat-id")
 	return cmd
 }
 
@@ -188,6 +187,54 @@ func oldWatermark(db *sql.DB) (int, error) {
 	return n, nil
 }
 
+// oldChannelID reads meta.channel_id the same way oldWatermark reads the
+// watermark. A missing meta table or key, or a value that does not parse as
+// a positive id, reports "not found" rather than an error: the caller's
+// remedy is an explicit --chat-id either way.
+func oldChannelID(db *sql.DB) (int64, bool, error) {
+	has, err := dbTableExists(db, "meta")
+	if err != nil || !has {
+		return 0, false, err
+	}
+	var v string
+	err = db.QueryRow(`SELECT value FROM meta WHERE key = 'channel_id'`).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	id, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false, nil
+	}
+	return id, true, nil
+}
+
+// deriveChatID resolves which dialog an old archive belongs to when
+// --chat-id is omitted. The downloads manifest is the authority — its
+// distinct dialog ids must be exactly one — with meta.channel_id (the same
+// table the watermark lives in) as the fallback for an empty manifest,
+// which carries no id of its own. When neither can tell, only an explicit
+// --chat-id can.
+func deriveChatID(db *sql.DB, dls []oldDownload) (int64, error) {
+	ids := distinctDialogIDs(dls)
+	if len(ids) > 1 {
+		return 0, fmt.Errorf("this archive mixes dialog id(s) %v; migrate db converts exactly one dialog per directory", ids)
+	}
+	if len(ids) == 1 && ids[0] > 0 {
+		return ids[0], nil
+	}
+	id, ok, err := oldChannelID(db)
+	if err != nil {
+		return 0, fmt.Errorf("read meta channel_id: %w", err)
+	}
+	if ok {
+		return id, nil
+	}
+	return 0, fmt.Errorf("cannot tell which dialog this archive belongs to (empty downloads manifest, no usable meta channel_id); pass --chat-id explicitly")
+}
+
 // dbTableExists reports whether db carries a table by that name.
 func dbTableExists(db *sql.DB, table string) (bool, error) {
 	var name string
@@ -222,18 +269,30 @@ func dbTableColumns(db *sql.DB, table string) (map[string]bool, error) {
 	return out, rows.Err()
 }
 
+// distinctDialogIDs returns the ascending distinct dialog ids among the old
+// downloads.
+func distinctDialogIDs(dls []oldDownload) []int64 {
+	seen := map[int64]bool{}
+	var ids []int64
+	for _, d := range dls {
+		if !seen[d.DialogID] {
+			seen[d.DialogID] = true
+			ids = append(ids, d.DialogID)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
 // mismatchedDialogIDs returns the distinct dialog ids among the old downloads
 // that differ from chatID, ascending — empty when the directory belongs to it.
 func mismatchedDialogIDs(dls []oldDownload, chatID int64) []int64 {
-	seen := map[int64]bool{}
 	var bad []int64
-	for _, d := range dls {
-		if d.DialogID != chatID && !seen[d.DialogID] {
-			seen[d.DialogID] = true
-			bad = append(bad, d.DialogID)
+	for _, id := range distinctDialogIDs(dls) {
+		if id != chatID {
+			bad = append(bad, id)
 		}
 	}
-	sort.Slice(bad, func(i, j int) bool { return bad[i] < bad[j] })
 	return bad
 }
 
@@ -290,7 +349,7 @@ func scanOldMedia(oldDir string, chatID int64) ([]mediaPlan, error) {
 	return out, nil
 }
 
-// expectedBase derives the v3 file name ("<msgID>_<name>") a done row's media
+// expectedBase derives the v3 file name ("<msgID>_<name>") a row's media
 // should live under when the old file itself is gone. The old row's recorded
 // path is the authority — the v2 downloader located files by prefix and the
 // name on disk may be sanitized away from the manifest's file_name — with
@@ -306,8 +365,8 @@ func expectedBase(d oldDownload, chat string) string {
 }
 
 // targetHasFile reports whether a previous run (or a later pipeline download)
-// already put the done row's file at its v3 location, size-verified against
-// the manifest size — the same check the downloader's verify applies.
+// already put the row's file at its v3 location, size-verified against the
+// manifest size — the same check the downloader's verify applies.
 func targetHasFile(root, chat string, d oldDownload) bool {
 	fi, err := os.Stat(filepath.Join(root, "media", chat, expectedBase(d, chat)))
 	return err == nil && !fi.IsDir() && fi.Size() == d.Size
@@ -422,8 +481,10 @@ func dialogTaskCounts(st *store.Store, dialogID int64) (done, pending, failed in
 // with --force every step heals (upserts are idempotent, ImportTasks never
 // rewinds progress, already-moved files are detected and kept).
 func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
-	if opts.ChatID <= 0 {
-		return fmt.Errorf("--chat-id must be a positive Telegram dialog id (got %d)", opts.ChatID)
+	// 0 means "derive from the archive"; only an explicitly negative value
+	// is a user mistake worth rejecting up front
+	if opts.ChatID < 0 {
+		return fmt.Errorf("--chat-id must be a positive Telegram dialog id, or omitted to derive it from the archive (got %d)", opts.ChatID)
 	}
 
 	oldDBPath := filepath.Join(oldDir, "archive.db")
@@ -451,6 +512,14 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 	wm, err := oldWatermark(odb)
 	if err != nil {
 		return err
+	}
+
+	// --chat-id omitted: let the archive say which dialog it is
+	if opts.ChatID == 0 {
+		opts.ChatID, err = deriveChatID(odb, dls)
+		if err != nil {
+			return err
+		}
 	}
 
 	// the directory must belong to the declared dialog: a wrong --chat-id
@@ -522,12 +591,17 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 		return err
 	}
 
-	// plan the task states around the media layout: done rows whose file is
-	// still in the old dir (or already at the target from a previous run)
-	// keep their verified state with the rewritten path; a done row whose
-	// file is in neither place is downgraded to pending so the next download
-	// self-heals it instead of the viewer showing a 404 hole; pending/failed
-	// rows keep their progress but drop paths that point at the old layout.
+	// plan the task states with the filesystem as the final authority for
+	// done-marking: whatever the old row says, a file present at exactly the
+	// manifest size — in the old dir (about to move) or already at the target
+	// from a previous run — lands the task done at the rewritten path, with
+	// attempts kept as recorded history and the error cleared, so a JSON-era
+	// archive imported as all-pending needs no post-migration download pass
+	// whose only job is re-verifying files already in place. A file present
+	// at the WRONG size counts as absent (it still moves; the row self-heals
+	// via download). Rows without a usable file keep the old split: done
+	// degrades to pending (the viewer must not show a 404 hole), and
+	// pending/failed keep their progress but drop old-layout paths.
 	chat := strconv.FormatInt(opts.ChatID, 10)
 	byMsg := make(map[int]mediaPlan, len(plans))
 	for _, p := range plans {
@@ -535,6 +609,7 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 	}
 	states := make([]store.TaskState, 0, len(dls))
 	downgraded := map[int]bool{}
+	promoted := map[int]bool{}
 	for _, d := range dls {
 		t := store.TaskState{
 			MsgID:      d.MsgID,
@@ -546,15 +621,23 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 			ActualSize: d.ActualSize,
 			Error:      d.Error,
 		}
-		if d.Status == store.StatusDone {
-			if p, ok := byMsg[d.MsgID]; ok {
-				t.Path = "media/" + chat + "/" + p.newBase
-			} else if targetHasFile(root, chat, d) {
-				t.Path = "media/" + chat + "/" + expectedBase(d, chat)
-			} else {
-				t = store.TaskState{MsgID: d.MsgID, FileName: d.FileName, Size: d.Size, MediaType: d.MediaType, Status: store.StatusPending}
-				downgraded[d.MsgID] = true
+		present := ""
+		if p, ok := byMsg[d.MsgID]; ok && p.size == d.Size {
+			present = p.newBase
+		} else if targetHasFile(root, chat, d) {
+			present = expectedBase(d, chat)
+		}
+		if present != "" {
+			t.Status = store.StatusDone
+			t.ActualSize = d.Size
+			t.Path = "media/" + chat + "/" + present
+			t.Error = ""
+			if d.Status != store.StatusDone {
+				promoted[d.MsgID] = true
 			}
+		} else if d.Status == store.StatusDone {
+			t = store.TaskState{MsgID: d.MsgID, FileName: d.FileName, Size: d.Size, MediaType: d.MediaType, Status: store.StatusPending}
+			downgraded[d.MsgID] = true
 		}
 		states = append(states, t)
 	}
@@ -570,7 +653,7 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 		}
 	}
 	expDone, expPending, expFailed := preDone, prePending, preFailed
-	downgradedApplied := 0
+	downgradedApplied, promotedApplied := 0, 0
 	for _, t := range states {
 		if _, ok, err := st.Attempts(opts.ChatID, t.MsgID); err != nil {
 			return err
@@ -587,6 +670,9 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 		}
 		if downgraded[t.MsgID] {
 			downgradedApplied++
+		}
+		if promoted[t.MsgID] {
+			promotedApplied++
 		}
 	}
 
@@ -672,8 +758,8 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 	}
 	fmt.Printf("[migrate] dialog %s (%s): %d message(s) incl. %d synthesized orphan placeholder(s), watermark %d\n",
 		chat, label, newMsgs, orphans, wmNow)
-	fmt.Printf("[migrate] tasks: done %d, pending %d+%d (downgraded), failed %d\n",
-		newDone, newPending-downgradedApplied, downgradedApplied, newFailed)
+	fmt.Printf("[migrate] tasks: done %d (incl. %d promoted), pending %d+%d (downgraded), failed %d\n",
+		newDone, promotedApplied, newPending-downgradedApplied, downgradedApplied, newFailed)
 	fmt.Printf("[migrate] media: %d/%d file(s) moved (%d/%d bytes), %d already present\n",
 		movedFiles, len(plans), movedBytes, plannedBytes, skippedFiles)
 	fmt.Printf("[migrate] export: %d snapshot(s) copied, logs: %d file(s) copied\n", nExport, nLogs)

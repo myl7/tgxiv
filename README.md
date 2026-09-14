@@ -264,7 +264,7 @@ Both paths are offline — no tdl call.
 - `tgxiv migrate [FILE...]` — unchanged: backfills content from JSON-era export
   snapshots under `export/`, or from tdl export JSON files you pass it, into
   the root's database (files untouched).
-- `tgxiv migrate db <old-channel-dir> --chat-id N [--username u] [--title t]
+- `tgxiv migrate db <old-channel-dir> [--chat-id N] [--username u] [--title t]
   [--kind channel|group|private] [--force]` — converts one old v2 one-channel
   archive directory (its own `archive.db` and flat
   `media/<chatID>_<msgID>_<name>` files) into a dialog of the root. Run it
@@ -272,6 +272,13 @@ Both paths are offline — no tdl call.
 
   - media is moved into `media/<dialog_id>/` (a rename when possible, with a
     copy-and-verify fallback) and task progress is preserved;
+  - `--chat-id` is optional: it is auto-derived from the archive (the
+    downloads manifest, falling back to the recorded channel id) and only
+    needs passing when the archive itself is ambiguous;
+  - a task whose file is found present at the right size — in the old
+    `media/` or already at its new location — is marked `done` whatever its
+    old status said, so no post-migration `download` pass is needed just to
+    reconcile states;
   - `done` tasks whose files went missing are downgraded to `pending`, so the
     next `download` self-heals them;
   - orphan manifest entries get placeholder content rows;

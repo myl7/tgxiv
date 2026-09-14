@@ -11,10 +11,11 @@ import (
 	"github.com/myl7/tgxiv/internal/store"
 )
 
-// oldV2Schema is the one-channel-per-directory layout the previous release
-// wrote: a messages content table, a downloads manifest with per-file
-// progress, and a meta table holding the watermark and channel id.
-const oldV2Schema = `
+// oldV2Tables is the one-channel-per-directory layout the previous release
+// wrote: a messages content table and a downloads manifest with per-file
+// progress. oldV2Schema adds the meta table holding the watermark and
+// channel id; the split lets a variant omit meta for derivation tests.
+const oldV2Tables = `
 CREATE TABLE messages (
     msg_id INTEGER PRIMARY KEY,
     type   TEXT    NOT NULL DEFAULT 'message',
@@ -36,7 +37,9 @@ CREATE TABLE downloads (
     path        TEXT    NOT NULL DEFAULT '',
     error       TEXT    NOT NULL DEFAULT '',
     updated_at  INTEGER NOT NULL DEFAULT 0
-);
+);`
+
+const oldV2Schema = oldV2Tables + `
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -67,9 +70,10 @@ func createOldDB(t *testing.T, dir, schema string, seed func(*sql.DB)) {
 //
 //	msg 11 done, media on disk            -> done, file moved, path rewritten
 //	msg 12 pending, one attempt, no file  -> pending, path dropped
-//	msg 13 failed at max attempts, file   -> failed, path dropped, file still moves
+//	msg 13 failed at max attempts, file   -> promoted done: file at manifest size, history kept
 //	msg 14 done but the file is gone      -> downgraded to pending, attempts 0
 //	msg 15 download without a message row -> orphan: placeholder content + task
+//	msg 16 pending, file on disk          -> promoted done: file at manifest size, history kept
 //
 // plus the decoys the scan must not touch: a stale .tmp partial, another
 // dialog's file, batch.json, and a log file.
@@ -81,6 +85,7 @@ func seedOldArchive(t *testing.T, dir string) {
 			{MsgID: 12, Type: "message", Date: 1700000002, Raw: `{"id":12}`},
 			{MsgID: 13, Type: "message", Date: 1700000003, Raw: `{"id":13}`},
 			{MsgID: 14, Type: "message", Date: 1700000004, Raw: `{"id":14}`},
+			{MsgID: 16, Type: "message", Date: 1700000006, Raw: `{"id":16}`},
 		}
 		for _, m := range msgs {
 			if _, err := db.Exec(
@@ -95,6 +100,7 @@ func seedOldArchive(t *testing.T, dir string) {
 			{MsgID: 13, DialogID: 100, FileName: "c.jpg", Size: 5, MediaType: "photo", Date: 1700000003, Status: "failed", Attempts: 3, Error: "expected 5 bytes, got 4"},
 			{MsgID: 14, DialogID: 100, FileName: "d.jpg", Size: 6, MediaType: "photo", Date: 1700000004, Status: "done", Attempts: 2, ActualSize: 6, Path: "media/100_14_d.jpg"},
 			{MsgID: 15, DialogID: 100, FileName: "e.jpg", Size: 7, MediaType: "photo", Date: 1700000005, Status: "pending"},
+			{MsgID: 16, DialogID: 100, FileName: "f.jpg", Size: 4, MediaType: "photo", Date: 1700000006, Status: "pending", Attempts: 2, Error: "partial write"},
 		}
 		for _, d := range dls {
 			if _, err := db.Exec(`
@@ -104,7 +110,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				t.Fatal(err)
 			}
 		}
-		for k, v := range map[string]string{"last_msg_id": "15", "channel_id": "100"} {
+		for k, v := range map[string]string{"last_msg_id": "16", "channel_id": "100"} {
 			if _, err := db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)`, k, v); err != nil {
 				t.Fatal(err)
 			}
@@ -118,6 +124,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	for name, content := range map[string]string{
 		"100_11_a.jpg":     "aaa",
 		"100_13_c.jpg":     "ccccc",
+		"100_16_f.jpg":     "ffff",
 		"100_11_a.jpg.tmp": "par", // stale partial: must stay
 		"999_11_z.jpg":     "zzz", // another dialog's file: must stay
 	} {
@@ -167,8 +174,9 @@ func TestMigrateDBConvertsV2Dir(t *testing.T) {
 	root := filepath.Join(base, "new")
 	seedOldArchive(t, oldDir)
 
+	// no --chat-id: the id is derived from the archive's own manifest (100)
 	if err := runMigrateDB(t, archive.Config{Dir: root, Namespace: "default"}, oldDir,
-		"--chat-id", "100", "--username", "@news", "--title", "News", "--kind", "channel"); err != nil {
+		"--username", "@news", "--title", "News", "--kind", "channel"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,17 +197,17 @@ SELECT username, title, kind, namespace, last_msg_id FROM dialogs WHERE dialog_i
 	if username != "news" || title != "News" || kind != "channel" || ns != "default" {
 		t.Errorf("dialog = %q,%q,%q,%q; want news,News,channel,default", username, title, kind, ns)
 	}
-	if wm != 15 {
-		t.Errorf("watermark = %d, want 15 (old meta last_msg_id)", wm)
+	if wm != 16 {
+		t.Errorf("watermark = %d, want 16 (old meta last_msg_id)", wm)
 	}
 
-	// content: the 4 old rows verbatim plus the synthesized orphan placeholder
+	// content: the 5 old rows verbatim plus the synthesized orphan placeholder
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE dialog_id = 100`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 5 {
-		t.Errorf("messages = %d, want 5 (4 verbatim + 1 orphan placeholder)", n)
+	if n != 6 {
+		t.Errorf("messages = %d, want 6 (5 verbatim + 1 orphan placeholder)", n)
 	}
 	var typ string
 	var date int
@@ -219,20 +227,24 @@ SELECT type, date, text, raw FROM messages WHERE dialog_id = 100 AND msg_id = 15
 		t.Errorf("msg 11 text = %q, want verbatim \"hello\"", text)
 	}
 
-	// task states: moved done keeps its verified state with the rewritten
-	// path; the file-less done is downgraded; failed keeps status with the
-	// old-layout path dropped; pending keeps its attempt count
+	// task states: files present at exactly the manifest size land done with
+	// the rewritten path whatever the old status said (attempts kept as
+	// history, error cleared); the file-less done is downgraded; pending and
+	// failed rows without files keep status, attempts, and error, path dropped
 	if s, a, asz, p, e := taskRow(t, db, 11); s != store.StatusDone || a != 0 || asz != 3 || p != "media/100/11_a.jpg" || e != "" {
 		t.Errorf("task 11 = %s,%d,%d,%q,%q; want done,0,3,media/100/11_a.jpg,\"\"", s, a, asz, p, e)
 	}
 	if s, a, asz, p, e := taskRow(t, db, 12); s != store.StatusPending || a != 1 || asz != 0 || p != "" || e != "short read" {
 		t.Errorf("task 12 = %s,%d,%d,%q,%q; want pending,1,0,\"\",short read", s, a, asz, p, e)
 	}
-	if s, a, asz, p, e := taskRow(t, db, 13); s != store.StatusFailed || a != 3 || asz != 0 || p != "" || e != "expected 5 bytes, got 4" {
-		t.Errorf("task 13 = %s,%d,%d,%q,%q; want failed,3,0,\"\",expected 5 bytes, got 4", s, a, asz, p, e)
+	if s, a, asz, p, e := taskRow(t, db, 13); s != store.StatusDone || a != 3 || asz != 5 || p != "media/100/13_c.jpg" || e != "" {
+		t.Errorf("task 13 = %s,%d,%d,%q,%q; want done,3,5,media/100/13_c.jpg,\"\" (failed promoted: file present)", s, a, asz, p, e)
 	}
 	if s, a, asz, p, e := taskRow(t, db, 14); s != store.StatusPending || a != 0 || asz != 0 || p != "" || e != "" {
 		t.Errorf("task 14 = %s,%d,%d,%q,%q; want pending,0,0,\"\",\"\" (done downgraded: file missing)", s, a, asz, p, e)
+	}
+	if s, a, asz, p, e := taskRow(t, db, 16); s != store.StatusDone || a != 2 || asz != 4 || p != "media/100/16_f.jpg" || e != "" {
+		t.Errorf("task 16 = %s,%d,%d,%q,%q; want done,2,4,media/100/16_f.jpg,\"\" (pending promoted: file present)", s, a, asz, p, e)
 	}
 	if s, a, _, p, _ := taskRow(t, db, 15); s != store.StatusPending || a != 0 || p != "" {
 		t.Errorf("task 15 = %s,%d,%q; want pending,0,\"\" (orphan)", s, a, p)
@@ -240,7 +252,7 @@ SELECT type, date, text, raw FROM messages WHERE dialog_id = 100 AND msg_id = 15
 
 	// media physically in the per-dialog dir; matched files gone from the old
 	// dir, decoys untouched
-	for name, want := range map[string]int64{"11_a.jpg": 3, "13_c.jpg": 5} {
+	for name, want := range map[string]int64{"11_a.jpg": 3, "13_c.jpg": 5, "16_f.jpg": 4} {
 		fi, err := os.Stat(filepath.Join(root, "media", "100", name))
 		if err != nil {
 			t.Fatalf("moved file %s: %v", name, err)
@@ -249,7 +261,7 @@ SELECT type, date, text, raw FROM messages WHERE dialog_id = 100 AND msg_id = 15
 			t.Errorf("moved %s = %d bytes, want %d", name, fi.Size(), want)
 		}
 	}
-	for name := range map[string]bool{"100_11_a.jpg": true, "100_13_c.jpg": true} {
+	for name := range map[string]bool{"100_11_a.jpg": true, "100_13_c.jpg": true, "100_16_f.jpg": true} {
 		if _, err := os.Stat(filepath.Join(oldDir, "media", name)); !os.IsNotExist(err) {
 			t.Errorf("old media still holds %s (err=%v); matched files must move out", name, err)
 		}
@@ -330,8 +342,8 @@ func TestMigrateDBForceRerunKeepsProgress(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE dialog_id = 100`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 5 {
-		t.Errorf("messages after --force = %d, want 5 (re-run adds no rows)", n)
+	if n != 6 {
+		t.Errorf("messages after --force = %d, want 6 (re-run adds no rows)", n)
 	}
 }
 
@@ -387,10 +399,138 @@ func TestMigrateDBGuardChatID(t *testing.T) {
 	oldDir := filepath.Join(t.TempDir(), "old")
 	seedOldArchive(t, oldDir)
 
-	for _, id := range []string{"0", "-5"} {
+	// 0 means "derive from the archive" and converts cleanly; only an
+	// explicitly negative id is a user mistake
+	for _, id := range []string{"-1", "-5"} {
 		err := runMigrateDB(t, archive.Config{Dir: t.TempDir()}, oldDir, "--chat-id="+id)
 		if err == nil || !strings.Contains(err.Error(), "--chat-id") {
-			t.Fatalf("--chat-id %s = %v; want the positive-id validation error", id, err)
+			t.Fatalf("--chat-id %s = %v; want the negative-id validation error", id, err)
 		}
+	}
+}
+
+func TestMigrateDBDerivesMixedDialogIDs(t *testing.T) {
+	oldDir := filepath.Join(t.TempDir(), "old")
+	root := filepath.Join(t.TempDir(), "new")
+	createOldDB(t, oldDir, oldV2Schema, func(db *sql.DB) {
+		if _, err := db.Exec(`INSERT INTO messages (msg_id, raw) VALUES (1, '{}'), (2, '{}')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO downloads (msg_id, dialog_id) VALUES (1, 100), (2, 999)`); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	err := runMigrateDB(t, archive.Config{Dir: root}, oldDir)
+	if err == nil || !strings.Contains(err.Error(), "100") || !strings.Contains(err.Error(), "999") ||
+		!strings.Contains(err.Error(), "one dialog per directory") {
+		t.Fatalf("mixed dialog ids = %v; want an error naming both ids and the one-dialog rule", err)
+	}
+	// the guard fires before the target opens: no half-converted root
+	if _, statErr := os.Stat(filepath.Join(root, "tgxiv.sqlite")); !os.IsNotExist(statErr) {
+		t.Errorf("target db exists after a guarded run (err=%v)", statErr)
+	}
+}
+
+func TestMigrateDBDerivesChatIDFromMeta(t *testing.T) {
+	oldDir := filepath.Join(t.TempDir(), "old")
+	root := filepath.Join(t.TempDir(), "new")
+	// JSON-era import left the manifest empty; meta still knows the channel
+	createOldDB(t, oldDir, oldV2Schema, func(db *sql.DB) {
+		if _, err := db.Exec(`INSERT INTO messages (msg_id, raw) VALUES (5, '{}')`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO meta (key, value) VALUES ('channel_id', '200'), ('last_msg_id', '5')`); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if err := runMigrateDB(t, archive.Config{Dir: root}, oldDir); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(root, "tgxiv.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var wm int
+	if err := db.QueryRow(`SELECT last_msg_id FROM dialogs WHERE dialog_id = 200`).Scan(&wm); err != nil {
+		t.Fatalf("dialog 200 (meta channel_id fallback): %v", err)
+	}
+	if wm != 5 {
+		t.Errorf("watermark = %d, want 5", wm)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages WHERE dialog_id = 200`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("messages = %d, want 1", n)
+	}
+}
+
+func TestMigrateDBDerivesChatIDUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		schema string
+		seed   func(*sql.DB) error
+	}{
+		{name: "no meta table", schema: oldV2Tables},
+		{name: "no channel_id key", schema: oldV2Schema, seed: func(db *sql.DB) error {
+			_, err := db.Exec(`INSERT INTO meta (key, value) VALUES ('last_msg_id', '5')`)
+			return err
+		}},
+		{name: "unparseable channel_id", schema: oldV2Schema, seed: func(db *sql.DB) error {
+			_, err := db.Exec(`INSERT INTO meta (key, value) VALUES ('channel_id', 'not-a-number')`)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldDir := filepath.Join(t.TempDir(), "old")
+			root := filepath.Join(t.TempDir(), "new")
+			createOldDB(t, oldDir, tc.schema, func(db *sql.DB) {
+				if tc.seed != nil {
+					if err := tc.seed(db); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+
+			err := runMigrateDB(t, archive.Config{Dir: root}, oldDir)
+			if err == nil || !strings.Contains(err.Error(), "cannot tell") || !strings.Contains(err.Error(), "--chat-id") {
+				t.Fatalf("no id source = %v; want the pass --chat-id explicitly error", err)
+			}
+			if _, statErr := os.Stat(filepath.Join(root, "tgxiv.sqlite")); !os.IsNotExist(statErr) {
+				t.Errorf("target db exists after a guarded run (err=%v)", statErr)
+			}
+		})
+	}
+}
+
+func TestMigrateDBPromotesFileAlreadyAtTarget(t *testing.T) {
+	base := t.TempDir()
+	oldDir := filepath.Join(base, "old")
+	root := filepath.Join(base, "new")
+	seedOldArchive(t, oldDir)
+
+	// msg 12 stays pending in the old dir (no file there), but a previous
+	// run already put its file at the v3 location at exactly the manifest size
+	if err := os.MkdirAll(filepath.Join(root, "media", "100"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "media", "100", "12_b.mp4"), []byte("bbbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runMigrateDB(t, archive.Config{Dir: root}, oldDir); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(root, "tgxiv.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if s, a, asz, p, e := taskRow(t, db, 12); s != store.StatusDone || a != 1 || asz != 4 || p != "media/100/12_b.mp4" || e != "" {
+		t.Errorf("task 12 = %s,%d,%d,%q,%q; want done,1,4,media/100/12_b.mp4,\"\" (promoted: file already at target)", s, a, asz, p, e)
 	}
 }
