@@ -16,7 +16,7 @@ export type ExportMessage = {
         }> | null;
         Media?: {
             Photo?: unknown;
-            Document?: { MimeType?: string } | null;
+            Document?: { MimeType?: string; Attributes?: Array<Record<string, unknown> | null> } | null;
         } | null;
     } | null;
 };
@@ -73,6 +73,8 @@ export type ViewMessage = {
     originalFileName?: string;
     fileUrl?: string;
     mediaKind: MediaKind;
+    /** Content kind a file card can preview as ("none" = not previewable). */
+    previewKind: MediaKind;
     raw?: Record<string, unknown>;
 };
 
@@ -106,18 +108,33 @@ export function getMediaKind(fileName: string): MediaKind {
 
 /**
  * Classify media by the message's raw send-type, not the file extension:
- * a jpeg sent as a document is a file. Telegram's send-type wins;
- * extension sniffing (getMediaKind) remains only as the no-raw fallback.
+ * inline players only for documents carrying the video/audio attribute;
+ * sent-as-file videos/audios and image documents stay file cards.
+ * Extension sniffing (getMediaKind) remains only as the no-raw fallback.
  */
 function mediaKindFromRaw(raw: ExportMessage["raw"], fileName: string): MediaKind {
     if (raw?.Media?.Photo) return "image";
     if (raw?.Media?.Document) {
-        const mime = raw.Media.Document.MimeType?.toLowerCase() ?? "";
-        if (mime.startsWith("video/")) return "video";
-        if (mime.startsWith("audio/")) return "audio";
-        return "file"; // documents that are images stay file cards
+        const attrs = raw.Media.Document.Attributes ?? [];
+        const isVideo = attrs.some((a) => !!a && "SupportsStreaming" in a);
+        const isAudio = attrs.some((a) => !!a && "Voice" in a);
+        if (isVideo) return "video";
+        if (isAudio) return "audio";
+        return "file";
     }
     return getMediaKind(fileName);
+}
+
+/**
+ * Content kind of a document from its MimeType; only meaningful for
+ * file cards (player kinds get a matching previewKind harmlessly).
+ */
+function previewKindFromDocument(raw: ExportMessage["raw"]): MediaKind {
+    const mime = raw?.Media?.Document?.MimeType?.toLowerCase() ?? "";
+    if (mime.startsWith("image/")) return "image";
+    if (mime.startsWith("video/")) return "video";
+    if (mime.startsWith("audio/")) return "audio";
+    return "none";
 }
 
 function formatDate(d: Date): string {
@@ -151,6 +168,13 @@ export function processMessages(data: ExportData, channelDirName: string): ViewM
     return sorted.map((msg) => {
         const hasFile = !!msg.file;
         const mediaKind = hasFile ? mediaKindFromRaw(msg.raw, msg.file!) : "none";
+        // Photos always preview as images; documents preview by their real
+        // content type even when rendered as a file card.
+        const previewKind = !hasFile
+            ? "none"
+            : mediaKind === "image"
+                ? "image"
+                : previewKindFromDocument(msg.raw);
         const fileUrl = hasFile
             ? `/${ATTACHMENTS_BASE_PATH}/${encodeURIComponent(channelDirName)}/${channelId}_${msg.id}`
             : undefined;
@@ -168,6 +192,7 @@ export function processMessages(data: ExportData, channelDirName: string): ViewM
             originalFileName: hasFile ? msg.file : undefined,
             fileUrl,
             mediaKind,
+            previewKind,
             raw: msg.raw ?? undefined,
         };
     });
