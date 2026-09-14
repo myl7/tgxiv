@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -33,6 +34,135 @@ func writeTdl(t *testing.T, path string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// writeTdlScript drops an executable fake tdl at path running the given shell
+// body. Unlike writeTdl's inert stub, this body does run: it prints canned
+// stdout (and records its arguments) so ChatList goes through the real exec
+// path.
+func writeTdlScript(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readScriptArgs reads back one argument per line, as recorded by a fake tdl's
+// 'printf %s "$@"' redirection, for exact-invocation asserts.
+func readScriptArgs(t *testing.T, path string) []string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+}
+
+// chatLsJSON is a canned "chat ls -o json" array covering every username shape
+// tdl emits: a real one, the "-" fallback for basic groups, and the key absent
+// entirely (omitempty).
+const chatLsJSON = `[` +
+	`{"id":3992083278,"type":"channel","visible_name":"Some Channel","username":"somechannel"},` +
+	`{"id":42,"type":"group","visible_name":"Grp","username":"-"},` +
+	`{"id":7,"type":"private","visible_name":""}` +
+	`]`
+
+// TestChatListParsesDialogs checks the happy path end-to-end: the exact
+// invocation (namespace flag, -o json, -f only when a filter is set) and the
+// parsed, normalized DialogInfo values.
+func TestChatListParsesDialogs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh script fake tdl")
+	}
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args")
+	writeTdlScript(t, filepath.Join(dir, "tdl"),
+		"printf '%s\\n' \"$@\" > \""+argsPath+"\"\n"+
+			"cat <<'JSON'\n"+chatLsJSON+"\nJSON\n")
+
+	r := &Runner{Bin: filepath.Join(dir, "tdl"), Namespace: "ns"}
+
+	ds, err := r.ChatList(context.Background(), ChatListOptions{})
+	if err != nil {
+		t.Fatalf("ChatList: %v", err)
+	}
+	want := []DialogInfo{
+		{ID: 3992083278, Type: "channel", Title: "Some Channel", Username: "somechannel"},
+		{ID: 42, Type: "group", Title: "Grp", Username: ""}, // "-" normalized away
+		{ID: 7, Type: "private", Title: "", Username: ""},   // key absent stays ""
+	}
+	if !reflect.DeepEqual(ds, want) {
+		t.Fatalf("ChatList = %#v, want %#v", ds, want)
+	}
+	if got, want := readScriptArgs(t, argsPath), []string{"-n", "ns", "chat", "ls", "-o", "json"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("invocation without filter = %q, want %q", got, want)
+	}
+
+	if _, err := r.ChatList(context.Background(), ChatListOptions{Filter: "ID == 3992083278"}); err != nil {
+		t.Fatalf("ChatList with filter: %v", err)
+	}
+	wantArgs := []string{"-n", "ns", "chat", "ls", "-o", "json", "-f", "ID == 3992083278"}
+	if got := readScriptArgs(t, argsPath); !reflect.DeepEqual(got, wantArgs) {
+		t.Fatalf("invocation with filter = %q, want %q", got, wantArgs)
+	}
+}
+
+// TestChatListEmpty checks that an empty dialog list is a nil slice, not an
+// error: "no dialogs" is a normal outcome of chat ls.
+func TestChatListEmpty(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh script fake tdl")
+	}
+	dir := t.TempDir()
+	writeTdlScript(t, filepath.Join(dir, "tdl"), "echo '[]'\n")
+
+	ds, err := (&Runner{Bin: filepath.Join(dir, "tdl"), Namespace: "ns"}).ChatList(context.Background(), ChatListOptions{})
+	if err != nil {
+		t.Fatalf("ChatList: %v", err)
+	}
+	if ds != nil {
+		t.Fatalf("ChatList = %#v, want nil", ds)
+	}
+}
+
+// TestChatListFailureNamesInvocation checks that a failing tdl surfaces as an
+// error naming the invocation, mirroring run()'s "tdl %v: %w" shape.
+func TestChatListFailureNamesInvocation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh script fake tdl")
+	}
+	dir := t.TempDir()
+	writeTdlScript(t, filepath.Join(dir, "tdl"), "exit 3\n")
+
+	_, err := (&Runner{Bin: filepath.Join(dir, "tdl"), Namespace: "ns"}).ChatList(context.Background(), ChatListOptions{})
+	if err == nil {
+		t.Fatal("ChatList succeeded despite tdl failing")
+	}
+	if !strings.Contains(err.Error(), "tdl") || !strings.Contains(err.Error(), "chat ls") {
+		t.Fatalf("error does not name the invocation: %v", err)
+	}
+}
+
+// TestChatListMalformedOutput checks the parse error: it must say the output
+// could not be parsed, and must NOT quote the output — dialog titles are
+// private data and have no business in logs.
+func TestChatListMalformedOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh script fake tdl")
+	}
+	dir := t.TempDir()
+	writeTdlScript(t, filepath.Join(dir, "tdl"), "echo 'TDLX-NOT-JSON'\n")
+
+	_, err := (&Runner{Bin: filepath.Join(dir, "tdl"), Namespace: "ns"}).ChatList(context.Background(), ChatListOptions{})
+	if err == nil {
+		t.Fatal("ChatList succeeded despite unparseable stdout")
+	}
+	if !strings.Contains(err.Error(), "parse") {
+		t.Fatalf("error does not mention the parse failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "TDLX-NOT-JSON") {
+		t.Fatalf("error leaks raw tdl output: %v", err)
 	}
 }
 

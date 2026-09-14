@@ -6,7 +6,9 @@
 package tdlx
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -57,6 +59,19 @@ type DownloadOptions struct {
 	KeepOrder bool   // --keep-order: download in batch-file order, not by message id
 }
 
+// DialogInfo is one entry of "tdl chat ls -o json" output.
+type DialogInfo struct {
+	ID       int64  // Telegram dialog id, bare positive form
+	Type     string // "private" | "channel" | "group" (tdl's designation, verbatim)
+	Title    string // visible_name; "" when the dialog has none
+	Username string // WITHOUT '@'; "" when absent (tdl emits "-" or omits the key)
+}
+
+// ChatListOptions configures "tdl chat ls".
+type ChatListOptions struct {
+	Filter string // -f expression over the dialog fields (e.g. "ID == 42"); empty lists everything
+}
+
 // Export runs "tdl chat export --all --with-content --raw" for one channel.
 // With SinceID > 0 it uses "--type id -i <SinceID>", which tdl interprets as
 // "messages with id >= SinceID" (verified against the API), fetching only the
@@ -103,6 +118,56 @@ func (r *Runner) Login(ctx context.Context, code bool) error {
 		mode = "code"
 	}
 	return r.run(ctx, []string{"login", "-T", mode})
+}
+
+// ChatList runs "tdl chat ls -o json" and parses the dialog list. Callers need
+// a dialog's numeric id, type, title, and @username — e.g. to resolve a channel
+// link to the id that export and download talk about — and chat ls is tdl's
+// only machine-readable view of them. Filter passes tdl a -f expression so a
+// lookup fetches exactly one dialog instead of listing every chat of the
+// account.
+func (r *Runner) ChatList(ctx context.Context, o ChatListOptions) ([]DialogInfo, error) {
+	args := []string{"chat", "ls", "-o", "json"}
+	if o.Filter != "" {
+		args = append(args, "-f", o.Filter)
+	}
+	out, err := r.runCapture(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		// tdl printed no list at all; "no dialogs" is not an error
+		return nil, nil
+	}
+	var ds []tdlDialog
+	// The output is deliberately not embedded in the error: dialog titles are
+	// private data and must not leak into logs; the json error already carries
+	// the offset of the offending byte.
+	if err := json.Unmarshal(out, &ds); err != nil {
+		return nil, fmt.Errorf("parse tdl chat ls output as a dialog JSON array: %w", err)
+	}
+	if len(ds) == 0 {
+		return nil, nil
+	}
+	is := make([]DialogInfo, len(ds))
+	for i, d := range ds {
+		is[i] = DialogInfo{ID: d.ID, Type: d.Type, Title: d.VisibleName, Username: d.Username}
+		if is[i].Username == "-" {
+			// tdl's fallback for basic groups, which have no username at all
+			is[i].Username = ""
+		}
+	}
+	return is, nil
+}
+
+// tdlDialog mirrors one object of tdl's "chat ls -o json" array under tdl's own
+// JSON names, so decoding is a plain Unmarshal. username is omitempty on tdl's
+// side: a missing key just leaves the field "".
+type tdlDialog struct {
+	ID          int64  `json:"id"`
+	Type        string `json:"type"`
+	VisibleName string `json:"visible_name"`
+	Username    string `json:"username"`
 }
 
 // resolveBin maps a configured Bin to the executable to launch. Only the bare
@@ -159,7 +224,33 @@ func (r *Runner) run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	return startWait(ctx, r.buildCmd(ctx, bin, args), args)
+}
 
+// runCapture is run for subcommands whose stdout is data to parse (chat ls -o
+// json), not progress chatter: stdout goes to a buffer, overriding Runner.Stdout,
+// while stderr keeps flowing to the runner's writer so tdl's zap logs stay
+// visible and a failing run can still explain itself.
+func (r *Runner) runCapture(ctx context.Context, args []string) ([]byte, error) {
+	bin, err := r.bin()
+	if err != nil {
+		return nil, err
+	}
+	cmd := r.buildCmd(ctx, bin, args)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := startWait(ctx, cmd, args); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// buildCmd assembles the exec.Cmd every subcommand launches: the -n namespace
+// prefix, the inherited standard streams, and the interrupt-then-kill
+// cancellation. Sharing one constructor keeps run and runCapture from drifting
+// apart on Ctrl-C handling; callers may only override cmd.Stdout (to capture
+// it) on the returned cmd.
+func (r *Runner) buildCmd(ctx context.Context, bin string, args []string) *exec.Cmd {
 	// namespace is a persistent flag, valid before the subcommand
 	full := append([]string{"-n", r.Namespace}, args...)
 
@@ -186,7 +277,14 @@ func (r *Runner) run(ctx context.Context, args []string) error {
 		return cmd.Process.Signal(os.Interrupt)
 	}
 	cmd.WaitDelay = 15 * time.Second
+	return cmd
+}
 
+// startWait runs a built cmd to completion and shapes failures the one way
+// every invocation reports them: start failures say so, a finished context's
+// own reason (cancel/deadline) beats the exec error it caused, and anything
+// else names the tdl invocation so logs show what was attempted.
+func startWait(ctx context.Context, cmd *exec.Cmd, args []string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start tdl: %w", err)
 	}
