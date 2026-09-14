@@ -166,6 +166,39 @@ func TestChatListMalformedOutput(t *testing.T) {
 	}
 }
 
+// TestDownloadArgs pins the exact "tdl dl" invocation: the batch file and
+// directory flags, the resume-safe defaults, and --template appearing only when
+// one is configured (the per-dialog media layout needs it; without it tdl's
+// default naming would re-prefix files with the dialog id).
+func TestDownloadArgs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh script fake tdl")
+	}
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args")
+	writeTdlScript(t, filepath.Join(dir, "tdl"),
+		"printf '%s\\n' \"$@\" > \""+argsPath+"\"\n")
+
+	r := &Runner{Bin: filepath.Join(dir, "tdl"), Namespace: "ns"}
+
+	if err := r.Download(context.Background(), DownloadOptions{BatchFile: "b.json", Dir: "media/100"}); err != nil {
+		t.Fatalf("Download without template: %v", err)
+	}
+	want := []string{"-n", "ns", "dl", "-f", "b.json", "-d", "media/100", "--skip-same", "--continue"}
+	if got := readScriptArgs(t, argsPath); !reflect.DeepEqual(got, want) {
+		t.Fatalf("invocation without template = %q, want %q", got, want)
+	}
+
+	tmpl := "{{ .MessageID }}_{{ filenamify .FileName }}"
+	if err := r.Download(context.Background(), DownloadOptions{BatchFile: "b.json", Dir: "media/100", Template: tmpl}); err != nil {
+		t.Fatalf("Download with template: %v", err)
+	}
+	want = append(want, "--template", tmpl)
+	if got := readScriptArgs(t, argsPath); !reflect.DeepEqual(got, want) {
+		t.Fatalf("invocation with template = %q, want %q", got, want)
+	}
+}
+
 // TestResolveBinVerbatim checks that any Bin other than the bare default "tdl"
 // is used as-is, without touching the filesystem (so nonexistent paths survive
 // until exec time, where they produce exec's own actionable error).

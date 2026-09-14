@@ -15,10 +15,10 @@ func writeFile(t *testing.T, dir, name string, size int) {
 
 func TestVerifyMatch(t *testing.T) {
 	dir := t.TempDir()
-	// tdl-style name: <dialogID>_<msgID>_<name>
-	writeFile(t, dir, "100_42_clip.mp4", 500)
+	// dlTemplate-style name: <msgID>_<name>, inside the dialog's media dir
+	writeFile(t, dir, "42_clip.mp4", 500)
 
-	vr, err := verify(dir, 100, 42, 500)
+	vr, err := verify(dir, 42, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,9 +32,9 @@ func TestVerifyMatch(t *testing.T) {
 
 func TestVerifySizeMismatch(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, dir, "100_42_clip.mp4", 499)
+	writeFile(t, dir, "42_clip.mp4", 499)
 
-	vr, err := verify(dir, 100, 42, 500)
+	vr, err := verify(dir, 42, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,9 +48,9 @@ func TestVerifySizeMismatch(t *testing.T) {
 
 func TestVerifyIgnoresTmp(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, dir, "100_42_clip.mp4.tmp", 500)
+	writeFile(t, dir, "42_clip.mp4.tmp", 500)
 
-	vr, err := verify(dir, 100, 42, 500)
+	vr, err := verify(dir, 42, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,9 +62,9 @@ func TestVerifyIgnoresTmp(t *testing.T) {
 func TestVerifyPrefixIsExact(t *testing.T) {
 	dir := t.TempDir()
 	// msg 10 must not satisfy a lookup for msg 1
-	writeFile(t, dir, "100_10_other.mp4", 500)
+	writeFile(t, dir, "10_other.mp4", 500)
 
-	vr, err := verify(dir, 100, 1, 500)
+	vr, err := verify(dir, 1, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestVerifyPrefixIsExact(t *testing.T) {
 
 func TestVerifyMissing(t *testing.T) {
 	dir := t.TempDir()
-	vr, err := verify(dir, 100, 42, 500)
+	vr, err := verify(dir, 42, 500)
 	if err != nil {
 		t.Fatal(err)
 	}

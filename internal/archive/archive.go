@@ -24,10 +24,29 @@ import (
 // ErrIdleTimeout marks a tdl batch killed by the idle watchdog (runBatch).
 var ErrIdleTimeout = errors.New("tdl idle timeout")
 
+// Disk layout under the archive root, one folder per dialog so a root holds
+// many dialogs without filename collisions: media/<dialogID>/ carries the
+// downloaded files, export/<dialogID>/ the transient export and batch files,
+// and logs/ stays flat at the root. dbName/legacyDBName guard against opening
+// a directory that still uses the pre-multi-dialog layout (see Open).
+const (
+	dbName        = "tgxiv.sqlite"
+	legacyDBName  = "archive.db"
+	mediaDirName  = "media"
+	exportDirName = "export"
+	logsDirName   = "logs"
+
+	// dlTemplate names tdl's output files "<msgID>_<file name>" inside the
+	// dialog's media dir. The dialog id moved from the old filename prefix
+	// ("<dialogID>_<msgID>_<name>", tdl's default) into the folder name, so
+	// files stay unique per dialog without the redundant prefix.
+	dlTemplate = "{{ .MessageID }}_{{ filenamify .FileName }}"
+)
+
 // Config is the archive's static configuration.
 type Config struct {
 	Dir         string        // archive root directory
-	Chat        string        // channel username, id, or link (for export)
+	Chat        string        // channel username, id, or link (for export); normalized by Open
 	Namespace   string        // tdl session namespace
 	TdlBin      string        // tdl executable
 	BatchSize   int           // messages per tdl dl invocation
@@ -43,6 +62,7 @@ type tdlRunner interface {
 	Check(context.Context) error
 	Export(context.Context, tdlx.ExportOptions) error
 	Download(context.Context, tdlx.DownloadOptions) error
+	ChatList(context.Context, tdlx.ChatListOptions) ([]tdlx.DialogInfo, error)
 }
 
 // Archive binds a Config to its open state DB and tdl runner. The DB holds
@@ -60,11 +80,22 @@ type Archive struct {
 	idleSample time.Duration
 }
 
-// Layout returns the standard sub-paths under the archive dir.
-func (c Config) dbPath() string    { return filepath.Join(c.Dir, "tgxiv.sqlite") }
-func (c Config) mediaDir() string  { return filepath.Join(c.Dir, "media") }
-func (c Config) exportDir() string { return filepath.Join(c.Dir, "export") }
-func (c Config) logsDir() string   { return filepath.Join(c.Dir, "logs") }
+// Layout helpers for the standard sub-paths under the archive dir.
+func (c Config) dbPath() string    { return filepath.Join(c.Dir, dbName) }
+func (c Config) mediaDir() string  { return filepath.Join(c.Dir, mediaDirName) }
+func (c Config) exportDir() string { return filepath.Join(c.Dir, exportDirName) }
+func (c Config) logsDir() string   { return filepath.Join(c.Dir, logsDirName) }
+
+// dialogMediaDir is where tdl downloads the dialog's files: media/<dialogID>/.
+func (c Config) dialogMediaDir(dialogID int64) string {
+	return filepath.Join(c.mediaDir(), strconv.FormatInt(dialogID, 10))
+}
+
+// dialogExportDir holds the dialog's transient export JSON and batch files:
+// export/<dialogID>/.
+func (c Config) dialogExportDir(dialogID int64) string {
+	return filepath.Join(c.exportDir(), strconv.FormatInt(dialogID, 10))
+}
 
 // Open prepares the archive directory, opens the DB, and builds the tdl runner.
 func Open(cfg Config) (*Archive, error) {
@@ -80,7 +111,24 @@ func Open(cfg Config) (*Archive, error) {
 	if cfg.Namespace == "" {
 		cfg.Namespace = "default"
 	}
+	// canonicalize the numeric forms of --chat up front, so every consumer
+	// (export, dialog resolution, filters) speaks the bare positive id
+	cfg.Chat = normalizeChat(cfg.Chat)
 
+	// Legacy-layout guard: a v2-era root carries archive.db and no tgxiv.sqlite.
+	// Silently adopting such a directory would build a second, parallel DB next
+	// to the old one and re-download everything into the new layout, so fail
+	// loudly and point at the converter instead.
+	if _, err := os.Stat(cfg.dbPath()); os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(cfg.Dir, legacyDBName)); err == nil {
+			return nil, fmt.Errorf("%s uses the old one-channel-per-directory layout; run `tgxiv migrate db` to convert it into the new multi-dialog root", cfg.Dir)
+		}
+	}
+
+	// Per-dialog folders under media/ and export/ appear on demand (MkdirAll
+	// in Export/runBatch); the roots themselves are created here. export/'s
+	// root included: JSON-era roots and migrate's replay of them expect it to
+	// exist without a prior tgxiv write.
 	for _, d := range []string{cfg.Dir, cfg.mediaDir(), cfg.exportDir(), cfg.logsDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, fmt.Errorf("create %s: %w", d, err)
@@ -120,7 +168,7 @@ func (a *Archive) Close() error { return a.store.Close() }
 // Store exposes the underlying store for read-only reporting (status command).
 func (a *Archive) Store() *store.Store { return a.store }
 
-// Chat returns the configured channel identifier.
+// Chat returns the configured channel identifier, in its normalized form.
 func (a *Archive) Chat() string { return a.cfg.Chat }
 
 // DialogID returns the dialog the last Import or Download operated on, or 0
@@ -129,6 +177,29 @@ func (a *Archive) DialogID() int64 { return a.dialogID }
 
 // LogsDir returns the archive's logs directory.
 func (a *Archive) LogsDir() string { return a.cfg.logsDir() }
+
+// normalizeChat canonicalizes a --chat value for the numeric forms Telegram
+// tools emit. Telegram's Bot API "marks" channel ids as -(1e12 + bare) and
+// clients often quote the marked form, while tdl and the state DB speak the
+// bare positive id: a purely numeric chat has its leading '-' dropped and a
+// 100-prefixed id above 1e12 unmarked. Anything non-numeric — a username or a
+// t.me link — passes through untouched.
+func normalizeChat(s string) string {
+	digits := strings.TrimPrefix(s, "-")
+	if digits == "" {
+		return s
+	}
+	n, err := strconv.ParseUint(digits, 10, 64)
+	if err != nil {
+		return s // usernames and links are not ids to rewrite
+	}
+	if n > 1e12 {
+		if bare, ok := strings.CutPrefix(digits, "100"); ok {
+			digits = bare
+		}
+	}
+	return digits
+}
 
 // ExportResult summarizes an export+import.
 type ExportResult struct {
@@ -148,25 +219,31 @@ func (a *Archive) Export(ctx context.Context, incremental bool) (ExportResult, e
 		return ExportResult{}, err
 	}
 
+	// Resolve once up front: the incremental watermark needs the dialog, and
+	// so does the transient export file's per-dialog placement. Unresolvable —
+	// a first export, or a multi-dialog root with no --chat — simply means a
+	// full export whose file lands under the root export/ dir.
+	dialogID, _ := a.resolveDialogID()
+
 	sinceID := 0
-	if incremental {
-		// The watermark is dialog-scoped. When the dialog cannot be pinned
-		// down yet — a first export, or a multi-dialog archive with no
-		// numeric --chat — a full export is the safe fallback: Import dedups
-		// whatever it re-fetches.
-		if dialogID, rerr := a.resolveDialogID(); rerr == nil {
-			wm, err := a.store.LastMsgID(dialogID)
-			if err != nil {
-				return ExportResult{}, err
-			}
-			if wm > 0 {
-				sinceID = wm + 1 // strictly newer than what we have
-			}
+	if incremental && dialogID != 0 {
+		wm, err := a.store.LastMsgID(dialogID)
+		if err != nil {
+			return ExportResult{}, err
+		}
+		if wm > 0 {
+			sinceID = wm + 1 // strictly newer than what we have
 		}
 	}
 
 	stamp := time.Now().Format("20060102-150405")
 	out := filepath.Join(a.cfg.exportDir(), stamp+".json")
+	if dialogID != 0 {
+		out = filepath.Join(a.cfg.dialogExportDir(dialogID), stamp+".json")
+	}
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return ExportResult{}, fmt.Errorf("create %s: %w", filepath.Dir(out), err)
+	}
 
 	if err := a.runner.Export(ctx, tdlx.ExportOptions{
 		Chat:    a.cfg.Chat,
@@ -183,6 +260,9 @@ func (a *Archive) Export(ctx context.Context, incremental bool) (ExportResult, e
 	// the export file is transport, not the archive: the DB now holds its
 	// content, so drop it (best effort, like the batch files)
 	_ = os.Remove(out)
+	// with the dialog id now learned from the export, refresh its metadata
+	// while the tdl session is live (best-effort; see refreshDialogMeta)
+	a.refreshDialogMeta(ctx, a.dialogID)
 	return ExportResult{
 		File:        out,
 		Added:       added,
@@ -252,6 +332,36 @@ func (a *Archive) Import(path string) (added int, err error) {
 	return added, nil
 }
 
+// refreshDialogMeta backfills the dialog's username, title, and kind from a
+// live "tdl chat ls" filtered to the id: export JSONs carry none of those,
+// but status output and username --chat matching want them. It is strictly
+// best-effort — the export has already succeeded, so an unavailable list or a
+// failed upsert only warns and the next export refreshes again.
+func (a *Archive) refreshDialogMeta(ctx context.Context, dialogID int64) {
+	if dialogID == 0 {
+		return
+	}
+	ds, err := a.runner.ChatList(ctx, tdlx.ChatListOptions{Filter: fmt.Sprintf("ID == %d", dialogID)})
+	if err != nil {
+		fmt.Printf("[archive] dialog metadata unavailable: %v\n", err)
+		return
+	}
+	if len(ds) != 1 {
+		fmt.Printf("[archive] dialog metadata unavailable: chat ls returned %d dialogs for id %d\n", len(ds), dialogID)
+		return
+	}
+	d := ds[0]
+	if err := a.store.UpsertDialog(store.Dialog{
+		DialogID:  dialogID,
+		Username:  d.Username,
+		Title:     d.Title,
+		Kind:      d.Type,
+		Namespace: a.cfg.Namespace,
+	}); err != nil {
+		fmt.Printf("[archive] dialog metadata unavailable: %v\n", err)
+	}
+}
+
 // DownloadResult summarizes a download run.
 type DownloadResult struct {
 	Done   int
@@ -291,62 +401,15 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 		res.Passes++
 		fmt.Printf("[archive] pass %d: %d pending (smallest first)\n", res.Passes, len(pending))
 
-		doneThisPass := 0
-		infraError := false
-		var lastBatchErr error
-
-		for _, batch := range chunk(pending, a.cfg.BatchSize) {
-			if err := ctx.Err(); err != nil {
-				return res, err
-			}
-
-			cmdErr := a.runBatch(ctx, dialogID, batch)
-			if cmdErr != nil && errors.Is(cmdErr, context.Canceled) {
-				return res, cmdErr
-			}
-			if cmdErr != nil {
-				infraError = true
-				lastBatchErr = cmdErr
-				note := "will not count as a file attempt"
-				if errors.Is(cmdErr, ErrIdleTimeout) {
-					note = "counts as a file attempt"
-				}
-				fmt.Printf("[archive] tdl batch error (%s): %v\n", note, cmdErr)
-			}
-
-			for _, r := range batch {
-				vr, err := verify(a.cfg.mediaDir(), dialogID, r.MsgID, r.Size)
-				if err != nil {
-					return res, err
-				}
-				switch {
-				case vr.matched:
-					if err := a.store.MarkDone(dialogID, r.MsgID, vr.actualSize, vr.path); err != nil {
-						return res, err
-					}
-					res.Done++
-					doneThisPass++
-				case cmdErr != nil && errors.Is(cmdErr, ErrIdleTimeout):
-					// the stall burned the batch's wall clock; charge it so a
-					// permanently stuck item fails instead of stalling reruns
-					if err := a.store.MarkAttempt(dialogID, r.MsgID, vr.actualSize, "tdl idle timeout", a.cfg.MaxAttempts); err != nil {
-						return res, err
-					}
-				case cmdErr != nil:
-					// infra failure: leave pending, do not burn an attempt
-				default:
-					// tdl succeeded but the file is missing or wrong size
-					msg := fmt.Sprintf("expected %d bytes, got %d (%s)", r.Size, vr.actualSize, describeMiss(vr))
-					if err := a.store.MarkAttempt(dialogID, r.MsgID, vr.actualSize, msg, a.cfg.MaxAttempts); err != nil {
-						return res, err
-					}
-				}
-			}
+		doneThisPass, lastBatchErr, err := a.runBatches(ctx, dialogID, chunk(pending, a.cfg.BatchSize))
+		if err != nil {
+			return res, err
 		}
+		res.Done += doneThisPass
 
 		// termination guard: if a pass made zero progress purely because tdl
 		// failed, stop instead of looping forever on an infra problem.
-		if doneThisPass == 0 && infraError {
+		if doneThisPass == 0 && lastBatchErr != nil {
 			return res, fmt.Errorf("tdl failed and no files were downloaded this pass (%w); fix the cause and rerun", lastBatchErr)
 		}
 	}
@@ -358,22 +421,209 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 	return res, nil
 }
 
-// runBatch writes the batch JSON and invokes tdl dl over it.
-func (a *Archive) runBatch(ctx context.Context, channelID int64, batch []store.Record) error {
-	batchFile := filepath.Join(a.cfg.exportDir(), "batch.json")
-	if err := writeBatch(batchFile, channelID, batch); err != nil {
+// TaskRef names one download task to retry, in the "<dialog_id>/<msg_id>"
+// form the download --retry flag takes.
+type TaskRef struct {
+	DialogID int64
+	MsgID    int
+}
+
+// RetryTasks re-downloads the named tasks regardless of their prior status:
+// each is flipped back to pending with its attempts zeroed, then downloaded in
+// a single pass of the ordinary batch machinery, grouped by dialog. tdl's
+// --skip-same keeps re-verifying an already-intact file cheap. Unlike Download
+// there is no outer retry loop: a retry is one pass, and what still fails is
+// reported as usual.
+func (a *Archive) RetryTasks(ctx context.Context, refs []TaskRef) (DownloadResult, error) {
+	var res DownloadResult
+	if len(refs) == 0 {
+		return res, nil
+	}
+	if err := a.runner.Check(ctx); err != nil {
+		return res, err
+	}
+
+	// group by dialog, keeping first-seen order so the run follows the input
+	byDialog := map[int64][]int{}
+	var order []int64
+	for _, ref := range refs {
+		if _, seen := byDialog[ref.DialogID]; !seen {
+			order = append(order, ref.DialogID)
+		}
+		byDialog[ref.DialogID] = append(byDialog[ref.DialogID], ref.MsgID)
+	}
+
+	// validate every ref before touching any state: a typo in the last entry
+	// must not leave the earlier ones half-reset
+	for _, dialogID := range order {
+		for _, msgID := range byDialog[dialogID] {
+			if _, ok, err := a.store.Attempts(dialogID, msgID); err != nil {
+				return res, err
+			} else if !ok {
+				return res, fmt.Errorf("no task %d/%d in state; check `tgxiv status` for the dialog and message ids", dialogID, msgID)
+			}
+		}
+	}
+
+	for _, dialogID := range order {
+		msgIDs := byDialog[dialogID]
+
+		for _, msgID := range msgIDs {
+			if _, err := a.store.ResetTask(dialogID, msgID); err != nil {
+				return res, err
+			}
+		}
+
+		// re-read exactly the retried records: ListPending sweeps the whole
+		// dialog, so filter it down to our ids. A reset task that does not
+		// come back pending means state disagrees with itself — surface it
+		// instead of silently skipping the retry.
+		pending, err := a.store.ListPending(dialogID)
+		if err != nil {
+			return res, err
+		}
+		want := msgIDSet(msgIDs)
+		var records []store.Record
+		for _, r := range pending {
+			if want[r.MsgID] {
+				records = append(records, r)
+				delete(want, r.MsgID)
+			}
+		}
+		for msgID := range want {
+			return res, fmt.Errorf("task %d/%d did not return to pending after reset; state is inconsistent", dialogID, msgID)
+		}
+
+		res.Passes++
+		done, lastBatchErr, err := a.runBatches(ctx, dialogID, chunk(records, a.cfg.BatchSize))
+		if err != nil {
+			return res, err
+		}
+		res.Done += done
+		// same guard as a Download pass: a no-progress infra failure must not
+		// read as "retry done, all good"
+		if done == 0 && lastBatchErr != nil {
+			return res, fmt.Errorf("tdl failed and no files were downloaded (%w); fix the cause and rerun", lastBatchErr)
+		}
+	}
+
+	// Failed counts only the retried tasks, intersected per dialog with the
+	// failed list: unrelated failures of other runs must not pollute the
+	// retry report.
+	for _, dialogID := range order {
+		failed, err := a.store.ListFailed(dialogID)
+		if err != nil {
+			return res, err
+		}
+		want := msgIDSet(byDialog[dialogID])
+		for _, r := range failed {
+			if want[r.MsgID] {
+				res.Failed++
+			}
+		}
+	}
+	return res, nil
+}
+
+// runBatches drives each batch through tdl (runBatch) and settles the task
+// status of every record in it: a size-verified file is MarkDone'd, a missing
+// or wrong-size file burns an attempt, an idle-killed batch is charged, and an
+// infra failure leaves the task pending for a later pass. It returns how many
+// records verified done and the last batch error (nil when every batch ran
+// clean). Download's multi-pass loop and RetryTasks' single pass share it, so
+// the settling rules exist exactly once.
+func (a *Archive) runBatches(ctx context.Context, dialogID int64, batches [][]store.Record) (done int, lastBatchErr error, err error) {
+	mediaDir := a.cfg.dialogMediaDir(dialogID)
+	for _, batch := range batches {
+		if err := ctx.Err(); err != nil {
+			return done, lastBatchErr, err
+		}
+
+		cmdErr := a.runBatch(ctx, dialogID, batch)
+		if cmdErr != nil && errors.Is(cmdErr, context.Canceled) {
+			return done, lastBatchErr, cmdErr
+		}
+		if cmdErr != nil {
+			lastBatchErr = cmdErr
+			note := "will not count as a file attempt"
+			if errors.Is(cmdErr, ErrIdleTimeout) {
+				note = "counts as a file attempt"
+			}
+			fmt.Printf("[archive] tdl batch error (%s): %v\n", note, cmdErr)
+		}
+
+		for _, r := range batch {
+			vr, err := verify(mediaDir, r.MsgID, r.Size)
+			if err != nil {
+				return done, lastBatchErr, err
+			}
+			switch {
+			case vr.matched:
+				if err := a.store.MarkDone(dialogID, r.MsgID, vr.actualSize, a.mediaStorePath(dialogID, vr.path)); err != nil {
+					return done, lastBatchErr, err
+				}
+				done++
+			case cmdErr != nil && errors.Is(cmdErr, ErrIdleTimeout):
+				// the stall burned the batch's wall clock; charge it so a
+				// permanently stuck item fails instead of stalling reruns
+				if err := a.store.MarkAttempt(dialogID, r.MsgID, vr.actualSize, "tdl idle timeout", a.cfg.MaxAttempts); err != nil {
+					return done, lastBatchErr, err
+				}
+			case cmdErr != nil:
+				// infra failure: leave pending, do not burn an attempt
+			default:
+				// tdl succeeded but the file is missing or wrong size
+				msg := fmt.Sprintf("expected %d bytes, got %d (%s)", r.Size, vr.actualSize, describeMiss(vr))
+				if err := a.store.MarkAttempt(dialogID, r.MsgID, vr.actualSize, msg, a.cfg.MaxAttempts); err != nil {
+					return done, lastBatchErr, err
+				}
+			}
+		}
+	}
+	return done, lastBatchErr, nil
+}
+
+// mediaStorePath converts an on-disk media file path into the root-relative
+// slash form stored in the DB ("media/<dialogID>/<name>"), so reports and the
+// viewer stay independent of where the archive root lives. A path that cannot
+// be related back to the root keeps the dialog-folder form of its basename,
+// which is still unique within the dialog's media dir.
+func (a *Archive) mediaStorePath(dialogID int64, path string) string {
+	if rel, err := filepath.Rel(a.cfg.Dir, path); err == nil {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(filepath.Join(mediaDirName, strconv.FormatInt(dialogID, 10), filepath.Base(path)))
+}
+
+// runBatch writes the batch JSON and invokes tdl dl over it, both scoped to
+// the dialog: batch.json lives in export/<dialogID>/ and files land in
+// media/<dialogID>/ named per dlTemplate.
+func (a *Archive) runBatch(ctx context.Context, dialogID int64, batch []store.Record) error {
+	exportDir := a.cfg.dialogExportDir(dialogID)
+	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", exportDir, err)
+	}
+	batchFile := filepath.Join(exportDir, "batch.json")
+	if err := writeBatch(batchFile, dialogID, batch); err != nil {
 		return err
 	}
 	defer func() { _ = os.Remove(batchFile) }()
 
+	mediaDir := a.cfg.dialogMediaDir(dialogID)
+	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", mediaDir, err)
+	}
+
 	opts := tdlx.DownloadOptions{
 		BatchFile: batchFile,
-		Dir:       a.cfg.mediaDir(),
+		Dir:       mediaDir,
 		Threads:   a.cfg.Threads,
 		Limit:     a.cfg.Limit,
 		// batches are written smallest-first; keep-order makes tdl honor that
 		// instead of re-sorting by message id, giving strict size ordering.
 		KeepOrder: true,
+		// "<msgID>_<name>": the dialog's folder carries the dialog id now
+		Template: dlTemplate,
 	}
 
 	if a.cfg.IdleTimeout <= 0 {
@@ -381,9 +631,11 @@ func (a *Archive) runBatch(ctx context.Context, channelID int64, batch []store.R
 	}
 
 	// Idle watchdog: tdl can hang forever on one media item (0-byte .tmp,
-	// idle TCP). Kill the batch once the media dir stops growing for
+	// idle TCP). Kill the batch once the dialog's media dir stops growing for
 	// IdleTimeout, so the batch's finished files still get verified and
-	// committed instead of waiting on the stuck one.
+	// committed instead of waiting on the stuck one. Watching the dialog's
+	// own dir, not the whole media/ tree, keeps another dialog's activity
+	// from keeping a stalled batch alive.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -391,7 +643,6 @@ func (a *Archive) runBatch(ctx context.Context, channelID int64, batch []store.R
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		mediaDir := a.cfg.mediaDir()
 		lastGrow := time.Now()
 		lastBytes, err := dirBytes(mediaDir)
 		if err != nil {
@@ -462,29 +713,62 @@ func dirBytes(dir string) (int64, error) {
 }
 
 // resolveDialogID pins down which dialog of the multi-dialog DB an operation
-// addresses. The dialog of the last Import wins; otherwise a numeric --chat
-// addresses a dialog directly — and an unknown id is an error, never a silent
-// fall-through to the sole dialog, because exporting dialog A against dialog
-// B's watermark would skip real messages; otherwise an archive holding
-// exactly one dialog is unambiguous. Anything else needs the user to
-// disambiguate, and the error names the known dialogs to point --chat at.
+// addresses: the dialog of the last Import wins when set, and anything else
+// defers to resolveChatDialogID.
 func (a *Archive) resolveDialogID() (int64, error) {
 	if a.dialogID != 0 {
 		return a.dialogID, nil
 	}
-	if id, err := strconv.ParseInt(a.cfg.Chat, 10, 64); err == nil {
-		_, ok, err := a.store.GetDialog(id)
-		if err != nil {
-			return 0, err
-		}
-		if ok {
-			return id, nil
-		}
-		return 0, fmt.Errorf("--chat %d matches no dialog in state; run export first or check the id", id)
+	return a.resolveChatDialogID()
+}
+
+// ResolveChatDialog resolves the --chat flag to a dialog id for commands that
+// filter by dialog (status, reset-failed). The bool is false when no --chat is
+// configured, meaning "operate on every dialog"; a configured --chat that
+// matches nothing is an actionable error, because silently reporting on the
+// wrong scope is worse than stopping.
+func (a *Archive) ResolveChatDialog() (int64, bool, error) {
+	if a.cfg.Chat == "" {
+		return 0, false, nil
 	}
+	id, err := a.resolveChatDialogID()
+	if err != nil {
+		return 0, true, err
+	}
+	return id, true, nil
+}
+
+// resolveChatDialogID is resolveDialogID without the last-operation cache:
+// which dialog does --chat address? A numeric --chat addresses a dialog
+// directly — and an unknown id is an error, never a silent fall-through to the
+// sole dialog, because exporting dialog A against dialog B's watermark would
+// skip real messages. A non-numeric --chat matches a dialog's stored username
+// case-insensitively (leading '@' optional), which is what makes
+// "sync --chat somechannel" incremental on a multi-dialog root. Otherwise an
+// archive holding exactly one dialog is unambiguous; anything else needs the
+// user to disambiguate, and the error names the known dialogs to point --chat
+// at.
+func (a *Archive) resolveChatDialogID() (int64, error) {
 	dialogs, err := a.store.ListDialogs()
 	if err != nil {
 		return 0, err
+	}
+	if a.cfg.Chat != "" {
+		if id, err := strconv.ParseInt(a.cfg.Chat, 10, 64); err == nil {
+			for _, d := range dialogs {
+				if d.DialogID == id {
+					return id, nil
+				}
+			}
+			return 0, fmt.Errorf("--chat %d matches no dialog in state; run export first or check the id", id)
+		}
+		want := strings.TrimPrefix(a.cfg.Chat, "@")
+		for _, d := range dialogs {
+			if d.Username != "" && strings.EqualFold(d.Username, want) {
+				return d.DialogID, nil
+			}
+		}
+		return 0, fmt.Errorf("--chat %s matches no dialog username in state; run export first or use the dialog id", a.cfg.Chat)
 	}
 	if len(dialogs) == 1 {
 		return dialogs[0].DialogID, nil
@@ -550,4 +834,14 @@ func chunk(recs []store.Record, size int) [][]store.Record {
 		out = append(out, recs[i:end])
 	}
 	return out
+}
+
+// msgIDSet is the membership helper the retry flow uses to intersect refs with
+// store listings.
+func msgIDSet(msgIDs []int) map[int]bool {
+	set := make(map[int]bool, len(msgIDs))
+	for _, id := range msgIDs {
+		set[id] = true
+	}
+	return set
 }

@@ -57,6 +57,11 @@ type DownloadOptions struct {
 	Threads   int    // --threads, 0 leaves tdl's default
 	Limit     int    // --limit, 0 leaves tdl's default
 	KeepOrder bool   // --keep-order: download in batch-file order, not by message id
+	// Template is --template, the output filename template (e.g.
+	// "{{ .MessageID }}_{{ filenamify .FileName }}"). Empty leaves tdl's own
+	// default "<dialogID>_<msgID>_<name>" naming; the per-dialog media layout
+	// overrides it because the dialog id moved into the directory.
+	Template string
 }
 
 // DialogInfo is one entry of "tdl chat ls -o json" output.
@@ -101,6 +106,9 @@ func (r *Runner) Download(ctx context.Context, o DownloadOptions) error {
 	}
 	if o.KeepOrder {
 		args = append(args, "--keep-order")
+	}
+	if o.Template != "" {
+		args = append(args, "--template", o.Template)
 	}
 	if o.Threads > 0 {
 		args = append(args, "--threads", fmt.Sprintf("%d", o.Threads))
