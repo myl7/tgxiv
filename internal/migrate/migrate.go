@@ -1,11 +1,14 @@
-// Package migrate is the legacy-import module: it backfills archive.db from
-// tdl export JSON that predates the DB-stores-content design. That means the
-// stamped snapshots the old pipeline kept in <dir>/export/, or any
-// "tdl chat export" file handed as an argument. It is deliberately
-// self-contained so that once every old archive is migrated, the whole package
-// can be deleted along with its single wiring line in internal/cli/root.go and
-// the README rows. Archive.Import stays in internal/archive because the live
-// Export path uses it.
+// Package migrate is the legacy-import module. Two entry points, both
+// deliberately offline (no tdl call): `migrate [FILE...]` backfills archive
+// content from tdl export JSON that predates the DB-stores-content design —
+// the stamped snapshots the old pipeline kept in export/, or any "tdl chat
+// export" file handed as an argument — and `migrate db` converts one old
+// one-channel-per-directory archive (v2 archive.db plus flat media/ files)
+// into a dialog of a current archive root, run once per old directory.
+// Because the package only serves the transition, it can be deleted once
+// every old archive is converted, along with its single wiring line in
+// internal/cli/root.go and the README rows. Archive.Import stays in
+// internal/archive because the live Export path uses it.
 package migrate
 
 import (
@@ -62,11 +65,13 @@ func replay(a *archive.Archive, exportDir string) (files int, err error) {
 	return files, nil
 }
 
-// New builds the migrate command, which is offline: it never invokes tdl.
+// New builds the migrate command, which is offline: it never invokes tdl. Its
+// default form replays export JSON; the `db` subcommand converts an old v2
+// channel archive directory.
 func New(cfg func() (archive.Config, error)) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "migrate [FILE...]",
-		Short: "Backfill archive.db from old export JSON: JSON-era snapshots in export/, or files given as args (offline, no tdl call)",
+		Short: "Backfill archive content from old export JSON, or convert an old v2 channel archive dir with `migrate db` (offline, no tdl call)",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := cfg()
@@ -123,4 +128,6 @@ func New(cfg func() (archive.Config, error)) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.AddCommand(newDBCmd(cfg))
+	return cmd
 }

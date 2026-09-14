@@ -580,6 +580,62 @@ func TestOpenRejectsV2Layout(t *testing.T) {
 	}
 }
 
+func TestImportTasks(t *testing.T) {
+	s := openTemp(t)
+	seedDialog(t, s, 1, 2)
+
+	// a full-state import: one done with burned attempts and a verified path,
+	// one failed with its error kept — neither may be flattened to pending
+	if err := s.ImportTasks(100, []TaskState{
+		{MsgID: 1, FileName: "a.jpg", Size: 10, MediaType: "photo", Status: StatusDone, Attempts: 2, ActualSize: 10, Path: "media/100/1_a.jpg"},
+		{MsgID: 2, FileName: "b.mp4", Size: 20, MediaType: "document", Status: StatusFailed, Attempts: 3, Error: "size mismatch"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var status string
+	var attempts int
+	var actualSize int64
+	var taskPath, errMsg string
+	if err := s.db.QueryRow(`
+SELECT status, attempts, actual_size, path, error FROM tasks WHERE dialog_id=100 AND msg_id=1`).
+		Scan(&status, &attempts, &actualSize, &taskPath, &errMsg); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusDone || attempts != 2 || actualSize != 10 || taskPath != "media/100/1_a.jpg" || errMsg != "" {
+		t.Errorf("task 1 = %s,%d,%d,%q,%q; want done,2,10,media/100/1_a.jpg,\"\"", status, attempts, actualSize, taskPath, errMsg)
+	}
+	if err := s.db.QueryRow(`
+SELECT status, attempts, path, error FROM tasks WHERE dialog_id=100 AND msg_id=2`).
+		Scan(&status, &attempts, &taskPath, &errMsg); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusFailed || attempts != 3 || taskPath != "" || errMsg != "size mismatch" {
+		t.Errorf("task 2 = %s,%d,%q,%q; want failed,3,\"\",size mismatch", status, attempts, taskPath, errMsg)
+	}
+
+	// conflict: re-importing msg 1 as a fresh pending row must not rewind the
+	// recorded progress
+	if err := s.ImportTasks(100, []TaskState{
+		{MsgID: 1, FileName: "a.jpg", Size: 10, MediaType: "photo", Status: StatusPending},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`
+SELECT status, attempts, actual_size, path FROM tasks WHERE dialog_id=100 AND msg_id=1`).
+		Scan(&status, &attempts, &actualSize, &taskPath); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusDone || attempts != 2 || actualSize != 10 || taskPath != "media/100/1_a.jpg" {
+		t.Errorf("task 1 after conflict = %s,%d,%d,%q; want done,2,10,media/100/1_a.jpg (existing row wins)", status, attempts, actualSize, taskPath)
+	}
+
+	// the FK still applies: a task for a message with no content row is rejected
+	if err := s.ImportTasks(100, []TaskState{{MsgID: 99, Status: StatusPending}}); err == nil {
+		t.Error("ImportTasks with no content row: want an FK error, got nil")
+	}
+}
+
 func TestUpsertContentLastWins(t *testing.T) {
 	s := openTemp(t)
 	if err := s.UpsertDialog(Dialog{DialogID: 100}); err != nil {

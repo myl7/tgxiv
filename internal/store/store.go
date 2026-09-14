@@ -93,6 +93,20 @@ type Record struct {
 	MediaType string
 }
 
+// TaskState is a tasks row with its full pipeline state, for one-shot imports
+// (the db migration) that must preserve progress rather than insert as pending.
+type TaskState struct {
+	MsgID      int
+	FileName   string
+	Size       int64
+	MediaType  string
+	Status     string // pending | done | failed
+	Attempts   int
+	ActualSize int64
+	Path       string // root-relative, slash form
+	Error      string
+}
+
 // ContentRecord is one message's viewer-facing content, media or text-only.
 // Raw holds the verbatim JSON of the message, entities included.
 type ContentRecord struct {
@@ -385,6 +399,40 @@ ON CONFLICT(dialog_id, msg_id) DO UPDATE SET
 		return 0, err
 	}
 	return added, nil
+}
+
+// ImportTasks inserts the dialog's tasks with their full state in one
+// transaction. On (dialog_id,msg_id) conflict the existing row wins entirely —
+// a --force re-run must not rewind progress made between runs. The FK on tasks
+// enforces that every message already has a content row.
+func (s *Store) ImportTasks(dialogID int64, tasks []TaskState) (err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.Prepare(`
+INSERT INTO tasks (dialog_id, msg_id, file_name, size, media_type, status, attempts, actual_size, path, error, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(dialog_id, msg_id) DO NOTHING`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	now := time.Now().Unix()
+	for _, t := range tasks {
+		if _, err = stmt.Exec(dialogID, t.MsgID, t.FileName, t.Size, t.MediaType,
+			t.Status, t.Attempts, t.ActualSize, t.Path, t.Error, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // MessageCount returns how many messages the dialog has content rows for,
