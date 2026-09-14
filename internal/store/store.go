@@ -37,7 +37,6 @@ CREATE TABLE IF NOT EXISTS dialogs (
     username    TEXT NOT NULL DEFAULT '',
     title       TEXT NOT NULL DEFAULT '',
     kind        TEXT NOT NULL DEFAULT '',
-    namespace   TEXT NOT NULL DEFAULT '',
     last_msg_id INTEGER NOT NULL DEFAULT 0,
     updated_at  INTEGER NOT NULL DEFAULT 0
 );
@@ -73,14 +72,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status_size ON tasks(status, size);`
 // Dialog is one archived chat. DialogID is the bare positive Telegram dialog
 // id (the form tdl accepts). Username carries no '@' prefix; "" means none.
 // Kind is "channel" | "group" | "private", stored leniently with no CHECK so
-// odd exports never bounce. Namespace records which tdl session namespace
-// the dialog was exported under. LastMsgID is the incremental sync watermark.
+// odd exports never bounce. LastMsgID is the incremental sync watermark.
 type Dialog struct {
 	DialogID  int64
 	Username  string // no '@' prefix; "" = none
 	Title     string
 	Kind      string // "channel" | "group" | "private"; lenient, no CHECK
-	Namespace string // tdl session namespace used when exporting; "" allowed
 	LastMsgID int    // incremental sync watermark
 	UpdatedAt int64
 }
@@ -250,21 +247,20 @@ func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // UpsertDialog inserts the dialog row, or refreshes an existing one. On
-// refresh, only the non-empty fields among username/title/kind/namespace are
-// applied — an empty value never wipes stored data, because not every export
-// knows every field. updated_at is always bumped; last_msg_id is never
-// touched here, so a metadata refresh can never rewind the sync watermark.
+// refresh, only the non-empty fields among username/title/kind are applied —
+// an empty value never wipes stored data, because not every export knows
+// every field. updated_at is always bumped; last_msg_id is never touched
+// here, so a metadata refresh can never rewind the sync watermark.
 func (s *Store) UpsertDialog(d Dialog) error {
 	_, err := s.db.Exec(`
-INSERT INTO dialogs (dialog_id, username, title, kind, namespace, last_msg_id, updated_at)
-VALUES (?, ?, ?, ?, ?, 0, ?)
+INSERT INTO dialogs (dialog_id, username, title, kind, last_msg_id, updated_at)
+VALUES (?, ?, ?, ?, 0, ?)
 ON CONFLICT(dialog_id) DO UPDATE SET
-    username   = CASE WHEN excluded.username  <> '' THEN excluded.username  ELSE dialogs.username END,
-    title      = CASE WHEN excluded.title     <> '' THEN excluded.title     ELSE dialogs.title END,
-    kind       = CASE WHEN excluded.kind      <> '' THEN excluded.kind      ELSE dialogs.kind END,
-    namespace  = CASE WHEN excluded.namespace <> '' THEN excluded.namespace ELSE dialogs.namespace END,
+    username   = CASE WHEN excluded.username <> '' THEN excluded.username ELSE dialogs.username END,
+    title      = CASE WHEN excluded.title    <> '' THEN excluded.title    ELSE dialogs.title END,
+    kind       = CASE WHEN excluded.kind     <> '' THEN excluded.kind     ELSE dialogs.kind END,
     updated_at = excluded.updated_at`,
-		d.DialogID, d.Username, d.Title, d.Kind, d.Namespace, time.Now().Unix())
+		d.DialogID, d.Username, d.Title, d.Kind, time.Now().Unix())
 	return err
 }
 
@@ -272,9 +268,9 @@ ON CONFLICT(dialog_id) DO UPDATE SET
 func (s *Store) GetDialog(id int64) (Dialog, bool, error) {
 	var d Dialog
 	err := s.db.QueryRow(`
-SELECT dialog_id, username, title, kind, namespace, last_msg_id, updated_at
+SELECT dialog_id, username, title, kind, last_msg_id, updated_at
 FROM dialogs WHERE dialog_id = ?`, id).
-		Scan(&d.DialogID, &d.Username, &d.Title, &d.Kind, &d.Namespace, &d.LastMsgID, &d.UpdatedAt)
+		Scan(&d.DialogID, &d.Username, &d.Title, &d.Kind, &d.LastMsgID, &d.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Dialog{}, false, nil
 	}
@@ -287,7 +283,7 @@ FROM dialogs WHERE dialog_id = ?`, id).
 // ListDialogs returns every dialog ordered by id.
 func (s *Store) ListDialogs() ([]Dialog, error) {
 	rows, err := s.db.Query(`
-SELECT dialog_id, username, title, kind, namespace, last_msg_id, updated_at
+SELECT dialog_id, username, title, kind, last_msg_id, updated_at
 FROM dialogs ORDER BY dialog_id`)
 	if err != nil {
 		return nil, err
@@ -297,7 +293,7 @@ FROM dialogs ORDER BY dialog_id`)
 	var out []Dialog
 	for rows.Next() {
 		var d Dialog
-		if err := rows.Scan(&d.DialogID, &d.Username, &d.Title, &d.Kind, &d.Namespace, &d.LastMsgID, &d.UpdatedAt); err != nil {
+		if err := rows.Scan(&d.DialogID, &d.Username, &d.Title, &d.Kind, &d.LastMsgID, &d.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -522,7 +518,7 @@ WHERE dialog_id=? AND msg_id=?`, dialogID, msgID)
 // dialog that has tasks, ordered by dialog id.
 func (s *Store) CountsByDialog() ([]DialogCounts, error) {
 	rows, err := s.db.Query(`
-SELECT d.dialog_id, d.username, d.title, d.kind, d.namespace, d.last_msg_id, d.updated_at,
+SELECT d.dialog_id, d.username, d.title, d.kind, d.last_msg_id, d.updated_at,
        COUNT(*),
        COALESCE(SUM(t.status = 'done'), 0),
        COALESCE(SUM(t.status = 'pending'), 0),
@@ -540,7 +536,7 @@ ORDER BY d.dialog_id`)
 		var dc DialogCounts
 		var total, done, pending, failed int64
 		if err := rows.Scan(&dc.Dialog.DialogID, &dc.Dialog.Username, &dc.Dialog.Title, &dc.Dialog.Kind,
-			&dc.Dialog.Namespace, &dc.Dialog.LastMsgID, &dc.Dialog.UpdatedAt,
+			&dc.Dialog.LastMsgID, &dc.Dialog.UpdatedAt,
 			&total, &done, &pending, &failed); err != nil {
 			return nil, err
 		}

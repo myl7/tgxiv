@@ -46,7 +46,7 @@ WHERE type='index' AND tbl_name=? AND name NOT LIKE 'sqlite_%'`, table)
 // must land before any manifest entry: tasks reference messages.
 func seedDialog(t *testing.T, s *Store, ids ...int) {
 	t.Helper()
-	if err := s.UpsertDialog(Dialog{DialogID: 100, Namespace: "default"}); err != nil {
+	if err := s.UpsertDialog(Dialog{DialogID: 100}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertContent(100, contentFor(ids...)); err != nil {
@@ -248,14 +248,14 @@ func TestMarkAttemptFailsAfterMax(t *testing.T) {
 func TestUpsertDialogNonClobber(t *testing.T) {
 	s := openTemp(t)
 
-	if err := s.UpsertDialog(Dialog{DialogID: 100, Username: "news", Title: "News", Kind: "channel", Namespace: "default"}); err != nil {
+	if err := s.UpsertDialog(Dialog{DialogID: 100, Username: "news", Title: "News", Kind: "channel"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AdvanceLastMsgID(100, 2913); err != nil {
 		t.Fatal(err)
 	}
 
-	// a refresh that only knows the title must not wipe username/kind/namespace
+	// a refresh that only knows the title must not wipe username/kind
 	if err := s.UpsertDialog(Dialog{DialogID: 100, Title: "News!"}); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestUpsertDialogNonClobber(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("GetDialog = %v,%v; want present", ok, err)
 	}
-	if d.Title != "News!" || d.Username != "news" || d.Kind != "channel" || d.Namespace != "default" {
+	if d.Title != "News!" || d.Username != "news" || d.Kind != "channel" {
 		t.Errorf("dialog = %+v; want title refreshed, other fields kept", d)
 	}
 	// and the watermark must survive the refresh
@@ -476,10 +476,13 @@ func TestOpenFreshAppliesV3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, col := range []string{"dialog_id", "username", "title", "kind", "namespace", "last_msg_id", "updated_at"} {
+	for _, col := range []string{"dialog_id", "username", "title", "kind", "last_msg_id", "updated_at"} {
 		if !dlgCols[col] {
 			t.Errorf("dialogs column %q missing", col)
 		}
+	}
+	if dlgCols["namespace"] {
+		t.Error("dialogs still has a namespace column; the tdl session namespace is a run-level flag, not per-dialog state")
 	}
 
 	// messages is keyed by (dialog_id, msg_id)

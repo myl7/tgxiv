@@ -314,9 +314,10 @@ func (a *Archive) Import(path string) (added int, err error) {
 
 	// dialogs -> messages -> tasks is the FK order: the dialog row must land
 	// before the content rows that reference it
-	if err := a.store.UpsertDialog(store.Dialog{DialogID: dialogID, Namespace: a.cfg.Namespace}); err != nil {
+	if err := a.store.UpsertDialog(store.Dialog{DialogID: dialogID}); err != nil {
 		return 0, err
 	}
+	a.writeDialogMarker(dialogID)
 	if err := a.store.UpsertContent(dialogID, contentRecs); err != nil {
 		return 0, err
 	}
@@ -352,13 +353,71 @@ func (a *Archive) refreshDialogMeta(ctx context.Context, dialogID int64) {
 	}
 	d := ds[0]
 	if err := a.store.UpsertDialog(store.Dialog{
-		DialogID:  dialogID,
-		Username:  d.Username,
-		Title:     d.Title,
-		Kind:      d.Type,
-		Namespace: a.cfg.Namespace,
+		DialogID: dialogID,
+		Username: d.Username,
+		Title:    d.Title,
+		Kind:     d.Type,
 	}); err != nil {
 		fmt.Printf("[archive] dialog metadata unavailable: %v\n", err)
+		return
+	}
+	// the stored row changed: refresh the marker from it
+	a.writeDialogMarker(dialogID)
+}
+
+// markerName is the marker file WriteDialogMarker drops into each dialog's
+// media folder; see WriteDialogMarker for why the name can never collide
+// with a downloaded file.
+const markerName = "dialog.txt"
+
+// WriteDialogMarker drops a short human-readable key-value pointer into the
+// dialog's media folder so a person browsing media/ can tell which channel
+// the numeric folder belongs to: "dialog_id:" always, "title:"/"username:"
+// lines only when the row knows them (username in its stored bare, no-'@'
+// form). The name dialog.txt can never collide with a downloaded file: every
+// tdl download is named "<msgID>_<name>" — digit-prefixed — and both the
+// downloader's verify glob and the viewer's prefix scan anchor on that digit
+// prefix; the old-layout media scan regex excludes it by the same property.
+func WriteDialogMarker(root string, d store.Dialog) error {
+	dir := filepath.Join(root, mediaDirName, strconv.FormatInt(d.DialogID, 10))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+
+	// scrub newlines from the values so each key stays exactly one line:
+	// titles are user-controlled text and an embedded '\n' would otherwise
+	// forge extra lines (usernames cannot carry one, but the defense is free)
+	scrub := strings.NewReplacer("\n", " ", "\r", " ")
+	var b strings.Builder
+	fmt.Fprintf(&b, "dialog_id: %d\n", d.DialogID)
+	if d.Title != "" {
+		fmt.Fprintf(&b, "title: %s\n", scrub.Replace(d.Title))
+	}
+	if d.Username != "" {
+		fmt.Fprintf(&b, "username: %s\n", scrub.Replace(d.Username))
+	}
+	if err := os.WriteFile(filepath.Join(dir, markerName), []byte(b.String()), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", filepath.Join(dir, markerName), err)
+	}
+	return nil
+}
+
+// writeDialogMarker is the best-effort post-upsert step the import paths
+// share: the row is read back first so UpsertDialog's non-clobber merge — not
+// this run's possibly-empty fields — decides what the marker says, and a
+// failure only warns on stderr because no archive operation may fail over it.
+func (a *Archive) writeDialogMarker(dialogID int64) {
+	d, ok, err := a.store.GetDialog(dialogID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[archive] dialog marker: %v\n", err)
+		return
+	}
+	if !ok {
+		fmt.Fprintf(os.Stderr, "[archive] dialog marker: dialog %d missing right after upsert\n", dialogID)
+		return
+	}
+	if err := WriteDialogMarker(a.cfg.Dir, d); err != nil {
+		fmt.Fprintf(os.Stderr, "[archive] dialog marker: %v\n", err)
 	}
 }
 

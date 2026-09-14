@@ -175,7 +175,7 @@ func TestMigrateDBConvertsV2Dir(t *testing.T) {
 	seedOldArchive(t, oldDir)
 
 	// no --chat-id: the id is derived from the archive's own manifest (100)
-	if err := runMigrateDB(t, archive.Config{Dir: root, Namespace: "default"}, oldDir,
+	if err := runMigrateDB(t, archive.Config{Dir: root}, oldDir,
 		"--username", "@news", "--title", "News", "--kind", "channel"); err != nil {
 		t.Fatal(err)
 	}
@@ -186,19 +186,27 @@ func TestMigrateDBConvertsV2Dir(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	// the dialog row: username de-@'d, manual title/kind, cfg namespace
-	var username, title, kind, ns string
+	// the dialog row: username de-@'d, manual title/kind
+	var username, title, kind string
 	var wm int
 	if err := db.QueryRow(`
-SELECT username, title, kind, namespace, last_msg_id FROM dialogs WHERE dialog_id = 100`).
-		Scan(&username, &title, &kind, &ns, &wm); err != nil {
+SELECT username, title, kind, last_msg_id FROM dialogs WHERE dialog_id = 100`).
+		Scan(&username, &title, &kind, &wm); err != nil {
 		t.Fatal(err)
 	}
-	if username != "news" || title != "News" || kind != "channel" || ns != "default" {
-		t.Errorf("dialog = %q,%q,%q,%q; want news,News,channel,default", username, title, kind, ns)
+	if username != "news" || title != "News" || kind != "channel" {
+		t.Errorf("dialog = %q,%q,%q; want news,News,channel", username, title, kind)
 	}
 	if wm != 16 {
 		t.Errorf("watermark = %d, want 16 (old meta last_msg_id)", wm)
+	}
+
+	// the marker in the NEW root names the dialog per the --username/--title
+	// flags, even though media/100/ did not exist before the conversion
+	if b, err := os.ReadFile(filepath.Join(root, "media", "100", "dialog.txt")); err != nil {
+		t.Errorf("dialog marker: %v", err)
+	} else if want := "dialog_id: 100\ntitle: News\nusername: news\n"; string(b) != want {
+		t.Errorf("dialog.txt = %q, want %q", b, want)
 	}
 
 	// content: the 5 old rows verbatim plus the synthesized orphan placeholder
@@ -298,9 +306,10 @@ func TestMigrateDBForceRerunKeepsProgress(t *testing.T) {
 	oldDir := filepath.Join(base, "old")
 	root := filepath.Join(base, "new")
 	seedOldArchive(t, oldDir)
-	cfg := archive.Config{Dir: root, Namespace: "default"}
+	cfg := archive.Config{Dir: root}
 
-	if err := runMigrateDB(t, cfg, oldDir, "--chat-id", "100"); err != nil {
+	// the first run records the dialog's metadata via the manual flags
+	if err := runMigrateDB(t, cfg, oldDir, "--chat-id", "100", "--username", "@news", "--title", "News"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -344,6 +353,15 @@ func TestMigrateDBForceRerunKeepsProgress(t *testing.T) {
 	}
 	if n != 6 {
 		t.Errorf("messages after --force = %d, want 6 (re-run adds no rows)", n)
+	}
+
+	// the re-run passed no metadata flags: the marker must still say what the
+	// first run recorded, because the stored row — not the re-run's empties —
+	// decides its content
+	if b, err := os.ReadFile(filepath.Join(root, "media", "100", "dialog.txt")); err != nil {
+		t.Errorf("dialog marker after --force: %v", err)
+	} else if want := "dialog_id: 100\ntitle: News\nusername: news\n"; string(b) != want {
+		t.Errorf("dialog.txt after --force = %q, want %q", b, want)
 	}
 }
 

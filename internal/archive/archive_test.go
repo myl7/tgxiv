@@ -577,6 +577,58 @@ func TestDirBytes(t *testing.T) {
 	}
 }
 
+// TestWriteDialogMarker pins the marker file's exact key-value content for
+// the four title/username combinations (absent field = absent line), the
+// newline scrubbing of values, and that a fresh media/<id>/ tree — the first
+// import's situation — is built rather than assumed.
+func TestWriteDialogMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		d    store.Dialog
+		want string
+	}{
+		{
+			name: "title and username",
+			d:    store.Dialog{DialogID: 100, Title: "Some Channel", Username: "somechannel"},
+			want: "dialog_id: 100\ntitle: Some Channel\nusername: somechannel\n",
+		},
+		{
+			name: "title only",
+			d:    store.Dialog{DialogID: 100, Title: "Some Channel"},
+			want: "dialog_id: 100\ntitle: Some Channel\n",
+		},
+		{
+			name: "username only",
+			d:    store.Dialog{DialogID: 100, Username: "somechannel"},
+			want: "dialog_id: 100\nusername: somechannel\n",
+		},
+		{
+			name: "neither",
+			d:    store.Dialog{DialogID: 100},
+			want: "dialog_id: 100\n",
+		},
+		{
+			name: "embedded newlines scrubbed to spaces",
+			d:    store.Dialog{DialogID: 100, Title: "Two\nLines\rHere", Username: "some\nchan"},
+			want: "dialog_id: 100\ntitle: Two Lines Here\nusername: some chan\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir() // no media/ tree yet: WriteDialogMarker must build it
+			if err := WriteDialogMarker(root, tc.d); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(filepath.Join(root, "media", "100", markerName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tc.want {
+				t.Errorf("dialog.txt = %q, want %q", b, tc.want)
+			}
+		})
+	}
+}
+
 func TestRetryTasksRetriesFailedTask(t *testing.T) {
 	fake := &fakeRunner{writeSize: map[int]int{1: 999, 2: 2}}
 	a := setup(t, Config{BatchSize: 10, MaxAttempts: 1}, fake, recsWithSizeEqualsID(1, 2))
@@ -840,6 +892,31 @@ func TestImportRecordsContent(t *testing.T) {
 	}
 }
 
+// TestImportWritesDialogMarker proves the marker written on import reflects
+// the STORED row: the import's bare upsert passes no metadata, so what a
+// previous run recorded — not this run's empties — must end up in the file.
+func TestImportWritesDialogMarker(t *testing.T) {
+	a := openBare(t, &fakeRunner{})
+	if err := a.store.UpsertDialog(store.Dialog{DialogID: 100, Title: "Some Channel", Username: "somechannel"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "delta.json")
+	if err := os.WriteFile(path, []byte(deltaExportJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.Import(path); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(a.cfg.mediaDir(), "100", markerName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "dialog_id: 100\ntitle: Some Channel\nusername: somechannel\n"; string(b) != want {
+		t.Errorf("dialog.txt = %q, want %q", b, want)
+	}
+}
+
 func TestExportRemovesFileOnSuccess(t *testing.T) {
 	fake := &fakeRunner{exportJSON: deltaExportJSON}
 	a := openBare(t, fake)
@@ -891,8 +968,36 @@ func TestRefreshDialogMetaUpserts(t *testing.T) {
 	if d.Username != "somechannel" || d.Title != "Some Channel" || d.Kind != "channel" {
 		t.Errorf("dialog = %+v, want the chat ls username/title/kind", d)
 	}
-	if d.Namespace != "default" {
-		t.Errorf("namespace = %q, want the archive's default", d.Namespace)
+}
+
+// TestRefreshDialogMetaRewritesMarker checks the marker tracks the stored row
+// across refreshes: a renamed channel rewrites the pointer file in place.
+func TestRefreshDialogMetaRewritesMarker(t *testing.T) {
+	fake := &fakeRunner{chatList: []tdlx.DialogInfo{{
+		ID: 100, Type: "channel", Title: "Some Channel", Username: "somechannel",
+	}}}
+	a := openBare(t, fake)
+	if err := a.store.UpsertDialog(store.Dialog{DialogID: 100, Title: "Old Title"}); err != nil {
+		t.Fatal(err)
+	}
+
+	a.refreshDialogMeta(context.Background(), 100)
+	b, err := os.ReadFile(filepath.Join(a.cfg.mediaDir(), "100", markerName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "dialog_id: 100\ntitle: Some Channel\nusername: somechannel\n"; string(b) != want {
+		t.Errorf("dialog.txt after refresh = %q, want %q", b, want)
+	}
+
+	// a later refresh that learned a new title rewrites the marker
+	fake.chatList = []tdlx.DialogInfo{{ID: 100, Type: "channel", Title: "Renamed", Username: "somechannel"}}
+	a.refreshDialogMeta(context.Background(), 100)
+	if b, err = os.ReadFile(filepath.Join(a.cfg.mediaDir(), "100", markerName)); err != nil {
+		t.Fatal(err)
+	}
+	if want := "dialog_id: 100\ntitle: Renamed\nusername: somechannel\n"; string(b) != want {
+		t.Errorf("dialog.txt after rename = %q, want %q", b, want)
 	}
 }
 

@@ -473,6 +473,27 @@ func dialogTaskCounts(st *store.Store, dialogID int64) (done, pending, failed in
 	return 0, 0, 0, nil
 }
 
+// writeDialogMarker reads the dialog row back and drops the human-readable
+// pointer file into the target root's media/<id>/, which may not exist yet on
+// a first run (WriteDialogMarker builds it). Reading the row back is what
+// makes a --force re-run without --username/--title keep the first run's
+// marker: the upsert's non-clobber merge, not this run's flags, decides the
+// content. Strictly best-effort — the marker must never fail the conversion.
+func writeDialogMarker(st *store.Store, root string, dialogID int64) {
+	d, ok, err := st.GetDialog(dialogID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[migrate] dialog marker: %v\n", err)
+		return
+	}
+	if !ok {
+		fmt.Fprintf(os.Stderr, "[migrate] dialog marker: dialog %d missing right after upsert\n", dialogID)
+		return
+	}
+	if err := archive.WriteDialogMarker(root, d); err != nil {
+		fmt.Fprintf(os.Stderr, "[migrate] dialog marker: %v\n", err)
+	}
+}
+
 // migrateDB converts one old v2 channel directory into a dialog of the root.
 // The run is DB-first — dialog row, content (with synthesized placeholders
 // for orphan downloads), tasks with their planned paths, watermark — then the
@@ -560,14 +581,14 @@ func migrateDB(c archive.Config, oldDir string, opts dbMigrateOptions) error {
 
 	username := strings.TrimPrefix(opts.Username, "@")
 	if err := st.UpsertDialog(store.Dialog{
-		DialogID:  opts.ChatID,
-		Username:  username,
-		Title:     opts.Title,
-		Kind:      opts.Kind,
-		Namespace: c.Namespace,
+		DialogID: opts.ChatID,
+		Username: username,
+		Title:    opts.Title,
+		Kind:     opts.Kind,
 	}); err != nil {
 		return err
 	}
+	writeDialogMarker(st, root, opts.ChatID)
 
 	// content rows verbatim, plus a synthesized placeholder for every orphan
 	// download (a v1-upgrade legacy: a manifest row whose message row was

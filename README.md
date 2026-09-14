@@ -90,11 +90,10 @@ flowchart LR
    it has been imported.
 2. **import** streams that JSON into `tgxiv.sqlite`. The dialog gets (or
    updates) its row in `dialogs` — title, username (stored without the `@`),
-   and kind are filled automatically from `tdl chat ls -o json`, and it
-   remembers the tdl namespace it belongs to. Every message gets a content row
-   in `messages` (text, type, date, raw); the media subset is additionally
-   upserted into `tasks` as `pending` (file name, size, media type). Each
-   import also advances the dialog's `last_msg_id` watermark.
+   and kind are filled automatically from `tdl chat ls -o json`. Every message
+   gets a content row in `messages` (text, type, date, raw); the media subset
+   is additionally upserted into `tasks` as `pending` (file name, size, media
+   type). Each import also advances the dialog's `last_msg_id` watermark.
 3. **download** takes the dialog's `pending` tasks ordered by size, splits them
    into batches, and runs `tdl dl` with `--keep-order --skip-same --continue`
    on each, into `media/<dialog_id>/` via
@@ -170,8 +169,7 @@ Configuration comes from flags or environment variables:
 Legacy `TGCA_*` env vars are still honored as fallback.
 
 > The `--ns` must match the namespace you logged in with. A plain
-> `tgxiv login` uses `default`, which is also tgxiv's default. Once a dialog
-> has been exported, it remembers the namespace it belongs to.
+> `tgxiv login` uses `default`, which is also tgxiv's default.
 
 ## Commands
 
@@ -251,6 +249,11 @@ On the next run:
   export/<dialog_id>/     # transient batch.json + export JSON during runs
   logs/                   # failed-<dialog_id>-<timestamp>.txt reports
 ```
+
+Every `media/<dialog_id>/` also holds a small `dialog.txt` key-value pointer
+file tgxiv maintains — `dialog_id` always, `title`/`username` lines when known
+(username in its stored no-`@` form) — so a person browsing the tree can tell
+which channel a numeric folder belongs to.
 
 One root hosts any number of dialogs — channels, groups, and private chats
 alike — one row each in `dialogs`, one subdirectory each under `media/`. The
