@@ -98,15 +98,24 @@ func New(cfg func() (archive.Config, error)) *cobra.Command {
 				fmt.Printf("imported %s; %d new media messages added to manifest\n", f, added)
 			}
 
-			msgs, err := a.Store().MessageCount()
+			// content rolls up across every dialog the replay touched
+			dialogs, err := a.Store().ListDialogs()
 			if err != nil {
 				return err
 			}
-			counts, err := a.Store().Counts()
+			msgs := 0
+			for _, d := range dialogs {
+				n, err := a.Store().MessageCount(d.DialogID)
+				if err != nil {
+					return err
+				}
+				msgs += n
+			}
+			counts, err := a.Store().CountsAll()
 			if err != nil {
 				return err
 			}
-			fmt.Printf("content: %d message(s)\n", msgs)
+			fmt.Printf("content: %d message(s) across %d dialog(s)\n", msgs, len(dialogs))
 			fmt.Printf("total:   %d\n", counts["total"])
 			fmt.Printf("done:    %d\n", counts[store.StatusDone])
 			fmt.Printf("pending: %d\n", counts[store.StatusPending])

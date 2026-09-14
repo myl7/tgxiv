@@ -1,4 +1,4 @@
-// Package archive orchestrates a channel archive: export the manifest with tdl,
+// Package archive orchestrates a dialog archive: export the manifest with tdl,
 // record it in a state DB, then download media smallest-first in batches,
 // verifying each file by size and retrying a bounded number of times.
 package archive
@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/myl7/tgxiv/internal/exportjson"
@@ -43,18 +45,23 @@ type tdlRunner interface {
 	Download(context.Context, tdlx.DownloadOptions) error
 }
 
-// Archive binds a Config to its open state DB and tdl runner.
+// Archive binds a Config to its open state DB and tdl runner. The DB holds
+// every dialog of the archive root, so the dialog a Download operates on is
+// resolved on demand (resolveDialogID).
 type Archive struct {
 	cfg    Config
 	store  *store.Store
 	runner tdlRunner
+	// dialogID caches the dialog the last Import or Download operated on, so
+	// a following step (failed-report, next Download) need not re-resolve it.
+	dialogID int64
 	// idleSample is the idle watchdog's dir-size sampling interval, derived
 	// from IdleTimeout in Open; tests shrink it to keep runs fast.
 	idleSample time.Duration
 }
 
 // Layout returns the standard sub-paths under the archive dir.
-func (c Config) dbPath() string    { return filepath.Join(c.Dir, "archive.db") }
+func (c Config) dbPath() string    { return filepath.Join(c.Dir, "tgxiv.sqlite") }
 func (c Config) mediaDir() string  { return filepath.Join(c.Dir, "media") }
 func (c Config) exportDir() string { return filepath.Join(c.Dir, "export") }
 func (c Config) logsDir() string   { return filepath.Join(c.Dir, "logs") }
@@ -116,6 +123,10 @@ func (a *Archive) Store() *store.Store { return a.store }
 // Chat returns the configured channel identifier.
 func (a *Archive) Chat() string { return a.cfg.Chat }
 
+// DialogID returns the dialog the last Import or Download operated on, or 0
+// when neither has run for this Archive.
+func (a *Archive) DialogID() int64 { return a.dialogID }
+
 // LogsDir returns the archive's logs directory.
 func (a *Archive) LogsDir() string { return a.cfg.logsDir() }
 
@@ -129,8 +140,9 @@ type ExportResult struct {
 
 // Export runs a tdl export into the export dir and imports it into the DB.
 // The export file itself is transient: it is deleted once imported. When
-// incremental is true it fetches only messages at or above the stored
-// watermark; with no watermark yet it falls back to a full export.
+// incremental is true it fetches only messages at or above the resolved
+// dialog's watermark; with no watermark — or no resolvable dialog — yet it
+// falls back to a full export.
 func (a *Archive) Export(ctx context.Context, incremental bool) (ExportResult, error) {
 	if err := a.runner.Check(ctx); err != nil {
 		return ExportResult{}, err
@@ -138,12 +150,18 @@ func (a *Archive) Export(ctx context.Context, incremental bool) (ExportResult, e
 
 	sinceID := 0
 	if incremental {
-		wm, err := a.store.LastMsgID()
-		if err != nil {
-			return ExportResult{}, err
-		}
-		if wm > 0 {
-			sinceID = wm + 1 // strictly newer than what we have
+		// The watermark is dialog-scoped. When the dialog cannot be pinned
+		// down yet — a first export, or a multi-dialog archive with no
+		// numeric --chat — a full export is the safe fallback: Import dedups
+		// whatever it re-fetches.
+		if dialogID, rerr := a.resolveDialogID(); rerr == nil {
+			wm, err := a.store.LastMsgID(dialogID)
+			if err != nil {
+				return ExportResult{}, err
+			}
+			if wm > 0 {
+				sinceID = wm + 1 // strictly newer than what we have
+			}
 		}
 	}
 
@@ -173,15 +191,16 @@ func (a *Archive) Export(ctx context.Context, incremental bool) (ExportResult, e
 	}, nil
 }
 
-// Import parses a tdl export JSON and records it in the DB: every message gets
-// a content row (text-only and service messages included; the DB is the text
-// archive), and the media subset is additionally upserted into the download
-// manifest.
+// Import parses a tdl export JSON and records it in the DB: the dialog row is
+// created (or refreshed) first because messages and tasks reference it, then
+// every message gets a content row (text-only and service messages included;
+// the DB is the text archive), the media subset is additionally upserted into
+// the download manifest, and finally the watermark advances.
 func (a *Archive) Import(path string) (added int, err error) {
 	var contentRecs []store.ContentRecord
 	var recs []store.Record
 	maxSeen := 0 // highest id of ANY message, for the incremental watermark
-	channelID, err := exportjson.ParseFile(path, func(m exportjson.Message) error {
+	dialogID, err := exportjson.ParseFile(path, func(m exportjson.Message) error {
 		if m.ID > maxSeen {
 			maxSeen = m.ID
 		}
@@ -203,11 +222,9 @@ func (a *Archive) Import(path string) (added int, err error) {
 		}
 		recs = append(recs, store.Record{
 			MsgID:     m.ID,
-			DialogID:  channelIDPlaceholder, // set below once known
 			FileName:  name,
 			Size:      info.Size,
 			MediaType: string(info.Type),
-			Date:      m.Date,
 		})
 		return nil
 	})
@@ -215,32 +232,25 @@ func (a *Archive) Import(path string) (added int, err error) {
 		return 0, fmt.Errorf("parse export: %w", err)
 	}
 
-	// stamp the resolved channel id onto every record and persist it
-	for i := range recs {
-		recs[i].DialogID = channelID
-	}
-	if err := a.store.SetMeta("channel_id", fmt.Sprintf("%d", channelID)); err != nil {
+	// dialogs -> messages -> tasks is the FK order: the dialog row must land
+	// before the content rows that reference it
+	if err := a.store.UpsertDialog(store.Dialog{DialogID: dialogID, Namespace: a.cfg.Namespace}); err != nil {
 		return 0, err
 	}
-	if err := a.store.SetMeta("namespace", a.cfg.Namespace); err != nil {
+	if err := a.store.UpsertContent(dialogID, contentRecs); err != nil {
 		return 0, err
 	}
-	if err := a.store.UpsertContent(contentRecs); err != nil {
-		return 0, err
-	}
-	added, err = a.store.UpsertManifest(recs)
+	added, err = a.store.UpsertManifest(dialogID, recs)
 	if err != nil {
 		return 0, err
 	}
 	// advance the watermark last: only after content and manifest are committed
-	if err := a.store.AdvanceLastMsgID(maxSeen); err != nil {
+	if err := a.store.AdvanceLastMsgID(dialogID, maxSeen); err != nil {
 		return added, err
 	}
+	a.dialogID = dialogID
 	return added, nil
 }
-
-// channelIDPlaceholder is overwritten before insert; kept explicit for clarity.
-const channelIDPlaceholder int64 = 0
 
 // DownloadResult summarizes a download run.
 type DownloadResult struct {
@@ -249,18 +259,20 @@ type DownloadResult struct {
 	Passes int
 }
 
-// Download downloads all pending media smallest-first, in batches, verifying
-// each file and retrying up to MaxAttempts across passes. It returns when
+// Download downloads a single dialog's pending media smallest-first, in
+// batches, verifying each file and retrying up to MaxAttempts across passes.
+// Which dialog to serve is resolved via resolveDialogID. It returns when
 // nothing is pending, or ctx is canceled, or tdl fails while making no progress.
 func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 	if err := a.runner.Check(ctx); err != nil {
 		return DownloadResult{}, err
 	}
 
-	channelID, err := a.channelID()
+	dialogID, err := a.resolveDialogID()
 	if err != nil {
 		return DownloadResult{}, err
 	}
+	a.dialogID = dialogID
 
 	var res DownloadResult
 	for {
@@ -268,7 +280,7 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 			return res, err
 		}
 
-		pending, err := a.store.ListPending()
+		pending, err := a.store.ListPending(dialogID)
 		if err != nil {
 			return res, err
 		}
@@ -288,7 +300,7 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 				return res, err
 			}
 
-			cmdErr := a.runBatch(ctx, channelID, batch)
+			cmdErr := a.runBatch(ctx, dialogID, batch)
 			if cmdErr != nil && errors.Is(cmdErr, context.Canceled) {
 				return res, cmdErr
 			}
@@ -303,13 +315,13 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 			}
 
 			for _, r := range batch {
-				vr, err := verify(a.cfg.mediaDir(), r.DialogID, r.MsgID, r.Size)
+				vr, err := verify(a.cfg.mediaDir(), dialogID, r.MsgID, r.Size)
 				if err != nil {
 					return res, err
 				}
 				switch {
 				case vr.matched:
-					if err := a.store.MarkDone(r.MsgID, vr.actualSize, vr.path); err != nil {
+					if err := a.store.MarkDone(dialogID, r.MsgID, vr.actualSize, vr.path); err != nil {
 						return res, err
 					}
 					res.Done++
@@ -317,7 +329,7 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 				case cmdErr != nil && errors.Is(cmdErr, ErrIdleTimeout):
 					// the stall burned the batch's wall clock; charge it so a
 					// permanently stuck item fails instead of stalling reruns
-					if err := a.store.MarkAttempt(r.MsgID, vr.actualSize, "tdl idle timeout", a.cfg.MaxAttempts); err != nil {
+					if err := a.store.MarkAttempt(dialogID, r.MsgID, vr.actualSize, "tdl idle timeout", a.cfg.MaxAttempts); err != nil {
 						return res, err
 					}
 				case cmdErr != nil:
@@ -325,7 +337,7 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 				default:
 					// tdl succeeded but the file is missing or wrong size
 					msg := fmt.Sprintf("expected %d bytes, got %d (%s)", r.Size, vr.actualSize, describeMiss(vr))
-					if err := a.store.MarkAttempt(r.MsgID, vr.actualSize, msg, a.cfg.MaxAttempts); err != nil {
+					if err := a.store.MarkAttempt(dialogID, r.MsgID, vr.actualSize, msg, a.cfg.MaxAttempts); err != nil {
 						return res, err
 					}
 				}
@@ -339,7 +351,7 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 		}
 	}
 
-	counts, err := a.store.Counts()
+	counts, err := a.store.CountsAll()
 	if err == nil {
 		res.Failed = counts[store.StatusFailed]
 	}
@@ -449,19 +461,43 @@ func dirBytes(dir string) (int64, error) {
 	return total, err
 }
 
-func (a *Archive) channelID() (int64, error) {
-	v, ok, err := a.store.GetMeta("channel_id")
+// resolveDialogID pins down which dialog of the multi-dialog DB an operation
+// addresses. The dialog of the last Import wins; otherwise a numeric --chat
+// addresses a dialog directly — and an unknown id is an error, never a silent
+// fall-through to the sole dialog, because exporting dialog A against dialog
+// B's watermark would skip real messages; otherwise an archive holding
+// exactly one dialog is unambiguous. Anything else needs the user to
+// disambiguate, and the error names the known dialogs to point --chat at.
+func (a *Archive) resolveDialogID() (int64, error) {
+	if a.dialogID != 0 {
+		return a.dialogID, nil
+	}
+	if id, err := strconv.ParseInt(a.cfg.Chat, 10, 64); err == nil {
+		_, ok, err := a.store.GetDialog(id)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return id, nil
+		}
+		return 0, fmt.Errorf("--chat %d matches no dialog in state; run export first or check the id", id)
+	}
+	dialogs, err := a.store.ListDialogs()
 	if err != nil {
 		return 0, err
 	}
-	if !ok {
-		return 0, fmt.Errorf("no channel id in state; run export first")
+	if len(dialogs) == 1 {
+		return dialogs[0].DialogID, nil
 	}
-	var id int64
-	if _, err := fmt.Sscan(v, &id); err != nil {
-		return 0, fmt.Errorf("bad channel id %q: %w", v, err)
+	if len(dialogs) == 0 {
+		return 0, fmt.Errorf("no dialogs in state; run export first")
 	}
-	return id, nil
+	ids := make([]string, len(dialogs))
+	for i, d := range dialogs {
+		ids[i] = strconv.FormatInt(d.DialogID, 10)
+	}
+	return 0, fmt.Errorf("archive holds %d dialogs; run export first, or point --chat at one of: %s",
+		len(dialogs), strings.Join(ids, ", "))
 }
 
 func describeMiss(vr verifyResult) string {

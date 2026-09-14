@@ -1,82 +1,96 @@
-// Package store is the SQLite-backed state of an archive, split across two
-// tables: messages holds the content of every message (media and text-only
-// alike, with the verbatim raw JSON as the viewer's source of truth), and
-// downloads holds the media pipeline manifest plus per-file status and retry
-// bookkeeping. The filesystem stays the final authority on "is the file really
-// there at the right size"; the DB records content, intent, progress,
-// attempts, and permanent failures, and it is the basis for future incremental
-// syncs.
+// Package store is the SQLite-backed state of an archive root holding MANY
+// dialogs. Three tables chain together with real foreign keys, and rows must
+// be written in that order: dialogs holds one row per archived chat (channel,
+// group, or private conversation), messages holds every message of every
+// dialog (media and text-only alike, with the verbatim raw JSON as the
+// viewer's source of truth), and tasks holds the media pipeline manifest plus
+// per-file status and retry bookkeeping, keyed by the message it belongs to.
+// The filesystem stays the final authority on "is the file really there at
+// the right size"; the DB records content, intent, progress, attempts, and
+// permanent failures, and it is the basis for incremental syncs.
 package store
 
 import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go sqlite driver, registered as "sqlite"
 )
 
-// Status values for a download row.
+// Status values for a task row.
 const (
 	StatusPending = "pending" // not yet downloaded, or awaiting retry
 	StatusDone    = "done"    // downloaded and size-verified
 	StatusFailed  = "failed"  // gave up after the max attempts
 )
 
-// schemaVersion is recorded in meta so future migrations can tell layouts
-// apart; v1 dbs predate the marker entirely.
-const schemaVersion = "2"
+// schema is the v3 multi-dialog layout. dialogs is the FK root: messages
+// reference it, tasks reference messages, so an import must create the dialog
+// row before content rows and content rows before manifest rows. task dates
+// are deliberately dropped: the owning message row already carries the date.
+const schema = `
+CREATE TABLE IF NOT EXISTS dialogs (
+    dialog_id   INTEGER PRIMARY KEY,
+    username    TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL DEFAULT '',
+    namespace   TEXT NOT NULL DEFAULT '',
+    last_msg_id INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
+);
 
-// contentSchema is factored out because the v1 -> v2 upgrade recreates the
-// content table on its own, inside its transaction.
-const contentSchema = `
 CREATE TABLE IF NOT EXISTS messages (
-    msg_id INTEGER PRIMARY KEY,
-    type   TEXT    NOT NULL DEFAULT 'message',
-    date   INTEGER NOT NULL DEFAULT 0,
-    text   TEXT    NOT NULL DEFAULT '',
-    file   TEXT    NOT NULL DEFAULT '',
-    raw    TEXT    NOT NULL DEFAULT ''
-);`
+    dialog_id INTEGER NOT NULL REFERENCES dialogs(dialog_id),
+    msg_id    INTEGER NOT NULL,
+    type      TEXT    NOT NULL DEFAULT 'message',
+    date      INTEGER NOT NULL DEFAULT 0,
+    text      TEXT    NOT NULL DEFAULT '',
+    file      TEXT    NOT NULL DEFAULT '',
+    raw       TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (dialog_id, msg_id)
+);
 
-const schema = contentSchema + `
-
-CREATE TABLE IF NOT EXISTS downloads (
-    msg_id      INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS tasks (
     dialog_id   INTEGER NOT NULL,
+    msg_id      INTEGER NOT NULL,
     file_name   TEXT    NOT NULL DEFAULT '',
     size        INTEGER NOT NULL DEFAULT 0,
     media_type  TEXT    NOT NULL DEFAULT '',
-    date        INTEGER NOT NULL DEFAULT 0,
     status      TEXT    NOT NULL DEFAULT 'pending',
     attempts    INTEGER NOT NULL DEFAULT 0,
     actual_size INTEGER NOT NULL DEFAULT 0,
     path        TEXT    NOT NULL DEFAULT '',
     error       TEXT    NOT NULL DEFAULT '',
-    updated_at  INTEGER NOT NULL DEFAULT 0
+    updated_at  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (dialog_id, msg_id),
+    FOREIGN KEY (dialog_id, msg_id) REFERENCES messages(dialog_id, msg_id)
 );
-CREATE INDEX IF NOT EXISTS idx_downloads_status_size ON downloads(status, size);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_size ON tasks(status, size);`
 
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '` + schemaVersion + `');
-`
+// Dialog is one archived chat. DialogID is the bare positive Telegram dialog
+// id (the form tdl accepts). Username carries no '@' prefix; "" means none.
+// Kind is "channel" | "group" | "private", stored leniently with no CHECK so
+// odd exports never bounce. Namespace records which tdl session namespace
+// the dialog was exported under. LastMsgID is the incremental sync watermark.
+type Dialog struct {
+	DialogID  int64
+	Username  string // no '@' prefix; "" = none
+	Title     string
+	Kind      string // "channel" | "group" | "private"; lenient, no CHECK
+	Namespace string // tdl session namespace used when exporting; "" allowed
+	LastMsgID int    // incremental sync watermark
+	UpdatedAt int64
+}
 
 // Record is a message's download-relevant manifest entry.
 type Record struct {
 	MsgID     int
-	DialogID  int64
 	FileName  string
 	Size      int64
 	MediaType string
-	Date      int
 }
 
 // ContentRecord is one message's viewer-facing content, media or text-only.
@@ -90,43 +104,49 @@ type ContentRecord struct {
 	Raw   string
 }
 
+// DialogCounts is a per-dialog rollup of task statuses.
+type DialogCounts struct {
+	Dialog  Dialog
+	Total   int
+	Done    int
+	Pending int
+	Failed  int
+}
+
 // Store wraps the archive database.
 type Store struct {
 	db *sql.DB
 }
 
-// Open opens (creating if needed) the archive DB at path and applies the
-// schema. A v1 db (single-table layout) is upgraded in place, keeping a
-// one-time copy of the original at <path>.v1.bak.
+// Open opens (creating if needed) the archive DB at path and applies the v3
+// schema. A file that still carries the old one-dialog-per-db v2 layout
+// (a messages table but no dialogs table) is rejected: it must be converted
+// first with "tgxiv migrate db".
 func Open(path string) (*Store, error) {
 	db, err := openDB(path)
 	if err != nil {
 		return nil, err
 	}
-	// A v1 messages table doubles as the download manifest; detect it before
-	// any schema write so the original file can be backed up untouched.
-	v1, err := isV1(db)
+
+	// Detect the v2 layout before any schema write, so the file is never
+	// half-migrated behind the user's back.
+	hasMessages, err := tableExists(db, "messages")
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("detect schema: %w", err)
 	}
-	if v1 {
-		// close first: the WAL gets checkpointed, leaving one whole file to copy
-		if err = db.Close(); err != nil {
-			return nil, err
-		}
-		if err = backupFile(path, path+".v1.bak"); err != nil {
-			return nil, fmt.Errorf("backup v1 db: %w", err)
-		}
-		if db, err = openDB(path); err != nil {
-			return nil, err
-		}
-		if err = upgradeV1(db); err != nil {
+	if hasMessages {
+		hasDialogs, err := tableExists(db, "dialogs")
+		if err != nil {
 			_ = db.Close()
-			return nil, fmt.Errorf("upgrade v1 db: %w", err)
+			return nil, fmt.Errorf("detect schema: %w", err)
 		}
-		return &Store{db: db}, nil
+		if !hasDialogs {
+			_ = db.Close()
+			return nil, fmt.Errorf("%s uses the old one-channel schema; run `tgxiv migrate db` to convert it first", path)
+		}
 	}
+
 	if _, err = db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
@@ -134,129 +154,61 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// openDB opens the archive db and applies the connection pragmas.
+// openDB opens the archive db with every per-connection pragma riding in the
+// DSN. PRAGMA foreign_keys (and busy_timeout) are per-connection state, and
+// database/sql pools connections, so an Exec'd pragma would only have covered
+// whichever single pooled connection served it — the DSN form makes the
+// driver apply them on every connection it opens. WAL lets reads proceed
+// during writes; busy_timeout absorbs lock waits; Ping fails fast on a file
+// that cannot be opened or created.
 func openDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
+	dsn := "file:" + escapeDSNPath(path) +
+		"?_pragma=foreign_keys(1)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	// one writer at a time; WAL lets reads proceed, busy_timeout absorbs waits
-	for _, pragma := range []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA foreign_keys=ON",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("%s: %w", pragma, err)
-		}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	return db, nil
 }
 
-// isV1 reports whether db carries the pre-split v1 layout: a messages table
-// that still has the download column dialog_id, and no schema_version marker
-// in meta.
-func isV1(db *sql.DB) (bool, error) {
-	cols, err := tableColumns(db, "messages")
+// escapeDSNPath percent-encodes the bytes sqlite's URI parser treats
+// specially in a path segment, so an archive directory containing them still
+// resolves. Everything else (slashes, the Windows drive colon) is passed
+// through verbatim, exactly like the plain-path form.
+func escapeDSNPath(path string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(path); i++ {
+		switch c := path[i]; c {
+		case '%', '?', '#':
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0xF])
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// tableExists reports whether db carries a table by that name.
+func tableExists(db *sql.DB, table string) (bool, error) {
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`, table).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	if !cols["dialog_id"] {
-		return false, nil // fresh or already v2
-	}
-	_, versioned, err := metaValue(db, "schema_version")
-	if err != nil {
-		return false, err
-	}
-	return !versioned, nil
-}
-
-// upgradeV1 migrates a v1 db in place in one transaction: the old messages
-// manifest becomes the downloads table, the index it carried over is replaced
-// by the properly-named one, a fresh empty content table takes the messages
-// name, and the schema version marker lands in meta. Content rows are not
-// backfilled; later imports repopulate them.
-func upgradeV1(db *sql.DB) (err error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
-	if _, err = tx.Exec(`ALTER TABLE messages RENAME TO downloads`); err != nil {
-		return err
-	}
-	// the renamed table keeps its old index, under the pre- or post-rename
-	// name depending on the sqlite build; drop whatever index is actually
-	// attached so the properly-named one can be created below
-	idxRows, err := tx.Query(`
-SELECT name FROM sqlite_master
-WHERE type='index' AND tbl_name='downloads' AND name NOT LIKE 'sqlite_%'`)
-	if err != nil {
-		return err
-	}
-	var idxNames []string
-	for idxRows.Next() {
-		var name string
-		if err = idxRows.Scan(&name); err != nil {
-			_ = idxRows.Close()
-			return err
-		}
-		idxNames = append(idxNames, name)
-	}
-	if err = idxRows.Err(); err != nil {
-		_ = idxRows.Close()
-		return err
-	}
-	_ = idxRows.Close()
-	for _, name := range idxNames {
-		if _, err = tx.Exec(`DROP INDEX IF EXISTS "` + name + `"`); err != nil {
-			return err
-		}
-	}
-	if _, err = tx.Exec(contentSchema); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_downloads_status_size ON downloads(status, size)`); err != nil {
-		return err
-	}
-	_, err = tx.Exec(`
-INSERT INTO meta (key, value) VALUES ('schema_version', ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value`, schemaVersion)
-	if err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// backupFile copies src to dst once; an existing dst is left untouched, so a
-// rerun never clobbers the earliest backup.
-func backupFile(src, dst string) (err error) {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if os.IsExist(err) {
-		return nil // keep the backup already on disk
-	}
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if cerr := out.Close(); err == nil && cerr != nil {
-			err = cerr
-		}
-	}()
-	_, err = io.Copy(out, in)
-	return err
+	return true, nil
 }
 
 // tableColumns lists the column names of table.
@@ -280,95 +232,70 @@ func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
 	return out, rows.Err()
 }
 
-// metaValue is GetMeta without a Store, for use during Open when the schema
-// (and possibly the meta table itself) is not guaranteed to exist yet.
-func metaValue(db *sql.DB, key string) (string, bool, error) {
-	var table string
-	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='meta'`).Scan(&table)
-	if err == sql.ErrNoRows {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	var v string
-	err = db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
-	switch err {
-	case sql.ErrNoRows:
-		return "", false, nil
-	case nil:
-		return v, true, nil
-	default:
-		return "", false, err
-	}
-}
-
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// UpsertManifest inserts new downloads as pending and refreshes the manifest
-// fields (dialog, name, size, type, date) of existing ones without touching
-// their status, attempts, or download result. Returns how many rows were newly
-// inserted. Runs in a single transaction.
-func (s *Store) UpsertManifest(recs []Record) (added int, err error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
-	// changes() after an upsert is 1 for insert and 2 for update, so we detect
-	// a fresh insert by checking existence first within the tx.
-	existsStmt, err := tx.Prepare(`SELECT 1 FROM downloads WHERE msg_id = ?`)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = existsStmt.Close() }()
-
-	upStmt, err := tx.Prepare(`
-INSERT INTO downloads (msg_id, dialog_id, file_name, size, media_type, date, status, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-ON CONFLICT(msg_id) DO UPDATE SET
-    dialog_id  = excluded.dialog_id,
-    file_name  = excluded.file_name,
-    size       = excluded.size,
-    media_type = excluded.media_type,
-    date       = excluded.date`)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = upStmt.Close() }()
-
-	now := time.Now().Unix()
-	for _, r := range recs {
-		var one int
-		switch scanErr := existsStmt.QueryRow(r.MsgID).Scan(&one); scanErr {
-		case sql.ErrNoRows:
-			added++
-		case nil:
-			// existing row, manifest refresh only
-		default:
-			return 0, scanErr
-		}
-		if _, err = upStmt.Exec(r.MsgID, r.DialogID, r.FileName, r.Size, r.MediaType, r.Date, now); err != nil {
-			return 0, err
-		}
-	}
-
-	if err = tx.Commit(); err != nil {
-		return 0, err
-	}
-	return added, nil
+// UpsertDialog inserts the dialog row, or refreshes an existing one. On
+// refresh, only the non-empty fields among username/title/kind/namespace are
+// applied — an empty value never wipes stored data, because not every export
+// knows every field. updated_at is always bumped; last_msg_id is never
+// touched here, so a metadata refresh can never rewind the sync watermark.
+func (s *Store) UpsertDialog(d Dialog) error {
+	_, err := s.db.Exec(`
+INSERT INTO dialogs (dialog_id, username, title, kind, namespace, last_msg_id, updated_at)
+VALUES (?, ?, ?, ?, ?, 0, ?)
+ON CONFLICT(dialog_id) DO UPDATE SET
+    username   = CASE WHEN excluded.username  <> '' THEN excluded.username  ELSE dialogs.username END,
+    title      = CASE WHEN excluded.title     <> '' THEN excluded.title     ELSE dialogs.title END,
+    kind       = CASE WHEN excluded.kind      <> '' THEN excluded.kind      ELSE dialogs.kind END,
+    namespace  = CASE WHEN excluded.namespace <> '' THEN excluded.namespace ELSE dialogs.namespace END,
+    updated_at = excluded.updated_at`,
+		d.DialogID, d.Username, d.Title, d.Kind, d.Namespace, time.Now().Unix())
+	return err
 }
 
-// UpsertContent inserts or fully refreshes content rows in a single
-// transaction. Existing rows get every field overwritten, and when recs holds
-// the same msg_id more than once the later record wins.
-func (s *Store) UpsertContent(recs []ContentRecord) (err error) {
+// GetDialog returns the dialog row; ok is false when no such dialog exists.
+func (s *Store) GetDialog(id int64) (Dialog, bool, error) {
+	var d Dialog
+	err := s.db.QueryRow(`
+SELECT dialog_id, username, title, kind, namespace, last_msg_id, updated_at
+FROM dialogs WHERE dialog_id = ?`, id).
+		Scan(&d.DialogID, &d.Username, &d.Title, &d.Kind, &d.Namespace, &d.LastMsgID, &d.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Dialog{}, false, nil
+	}
+	if err != nil {
+		return Dialog{}, false, err
+	}
+	return d, true, nil
+}
+
+// ListDialogs returns every dialog ordered by id.
+func (s *Store) ListDialogs() ([]Dialog, error) {
+	rows, err := s.db.Query(`
+SELECT dialog_id, username, title, kind, namespace, last_msg_id, updated_at
+FROM dialogs ORDER BY dialog_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []Dialog
+	for rows.Next() {
+		var d Dialog
+		if err := rows.Scan(&d.DialogID, &d.Username, &d.Title, &d.Kind, &d.Namespace, &d.LastMsgID, &d.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// UpsertContent inserts or fully refreshes the dialog's content rows in a
+// single transaction. Existing rows get every field overwritten, and when
+// recs holds the same msg_id more than once the later record wins. The dialog
+// row must already exist; the FK on messages enforces that.
+func (s *Store) UpsertContent(dialogID int64, recs []ContentRecord) (err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -381,9 +308,9 @@ func (s *Store) UpsertContent(recs []ContentRecord) (err error) {
 
 	// raw can be sizeable, so one prepared statement serves the whole batch
 	stmt, err := tx.Prepare(`
-INSERT INTO messages (msg_id, type, date, text, file, raw)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(msg_id) DO UPDATE SET
+INSERT INTO messages (dialog_id, msg_id, type, date, text, file, raw)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(dialog_id, msg_id) DO UPDATE SET
     type = excluded.type,
     date = excluded.date,
     text = excluded.text,
@@ -395,46 +322,88 @@ ON CONFLICT(msg_id) DO UPDATE SET
 	defer func() { _ = stmt.Close() }()
 
 	for _, r := range recs {
-		if _, err = stmt.Exec(r.MsgID, r.Type, r.Date, r.Text, r.File, r.Raw); err != nil {
+		if _, err = stmt.Exec(dialogID, r.MsgID, r.Type, r.Date, r.Text, r.File, r.Raw); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// MessageCount returns how many messages have content rows, text-only ones
-// included.
-func (s *Store) MessageCount() (int, error) {
+// UpsertManifest inserts new tasks as pending and refreshes the manifest
+// fields (name, size, type) of existing ones without touching their status,
+// attempts, or download result. Returns how many rows were newly inserted.
+// Runs in a single transaction. The FK on tasks enforces that every message
+// already has a content row; callers must not add a redundant pre-check.
+func (s *Store) UpsertManifest(dialogID int64, recs []Record) (added int, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// changes() after an upsert is 1 for insert and 2 for update, so we detect
+	// a fresh insert by checking existence first within the tx.
+	existsStmt, err := tx.Prepare(`SELECT 1 FROM tasks WHERE dialog_id = ? AND msg_id = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = existsStmt.Close() }()
+
+	upStmt, err := tx.Prepare(`
+INSERT INTO tasks (dialog_id, msg_id, file_name, size, media_type, status, updated_at)
+VALUES (?, ?, ?, ?, ?, 'pending', ?)
+ON CONFLICT(dialog_id, msg_id) DO UPDATE SET
+    file_name  = excluded.file_name,
+    size       = excluded.size,
+    media_type = excluded.media_type`)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = upStmt.Close() }()
+
+	now := time.Now().Unix()
+	for _, r := range recs {
+		var one int
+		switch scanErr := existsStmt.QueryRow(dialogID, r.MsgID).Scan(&one); scanErr {
+		case sql.ErrNoRows:
+			added++
+		case nil:
+			// existing row, manifest refresh only
+		default:
+			return 0, scanErr
+		}
+		if _, err = upStmt.Exec(dialogID, r.MsgID, r.FileName, r.Size, r.MediaType, now); err != nil {
+			return 0, err
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return added, nil
+}
+
+// MessageCount returns how many messages the dialog has content rows for,
+// text-only ones included.
+func (s *Store) MessageCount(dialogID int64) (int, error) {
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE dialog_id = ?`, dialogID).Scan(&n); err != nil {
 		return 0, err
 	}
 	return n, nil
 }
 
-// ContentMessage returns the stored content row of msgID; ok is false when it
-// has no content row.
-func (s *Store) ContentMessage(msgID int) (rec ContentRecord, ok bool, err error) {
-	err = s.db.QueryRow(`
-SELECT msg_id, type, date, text, file, raw FROM messages WHERE msg_id = ?`, msgID).
-		Scan(&rec.MsgID, &rec.Type, &rec.Date, &rec.Text, &rec.File, &rec.Raw)
-	switch err {
-	case sql.ErrNoRows:
-		return ContentRecord{}, false, nil
-	case nil:
-		return rec, true, nil
-	default:
-		return ContentRecord{}, false, err
-	}
-}
-
-// ListPending returns all pending downloads ordered by size ascending
+// ListPending returns the dialog's pending tasks ordered by size ascending
 // (smallest first), then by msg_id for a stable order among equal sizes.
-func (s *Store) ListPending() ([]Record, error) {
+func (s *Store) ListPending(dialogID int64) ([]Record, error) {
 	rows, err := s.db.Query(`
-SELECT msg_id, dialog_id, file_name, size, media_type, date
-FROM downloads WHERE status = 'pending'
-ORDER BY size ASC, msg_id ASC`)
+SELECT msg_id, file_name, size, media_type
+FROM tasks WHERE dialog_id = ? AND status = 'pending'
+ORDER BY size ASC, msg_id ASC`, dialogID)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +412,7 @@ ORDER BY size ASC, msg_id ASC`)
 	var out []Record
 	for rows.Next() {
 		var r Record
-		if err := rows.Scan(&r.MsgID, &r.DialogID, &r.FileName, &r.Size, &r.MediaType, &r.Date); err != nil {
+		if err := rows.Scan(&r.MsgID, &r.FileName, &r.Size, &r.MediaType); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -452,32 +421,32 @@ ORDER BY size ASC, msg_id ASC`)
 }
 
 // MarkDone records a successful, size-verified download.
-func (s *Store) MarkDone(msgID int, actualSize int64, path string) error {
+func (s *Store) MarkDone(dialogID int64, msgID int, actualSize int64, path string) error {
 	_, err := s.db.Exec(`
-UPDATE downloads SET status='done', actual_size=?, path=?, error='', updated_at=?
-WHERE msg_id=?`, actualSize, path, time.Now().Unix(), msgID)
+UPDATE tasks SET status='done', actual_size=?, path=?, error='', updated_at=?
+WHERE dialog_id=? AND msg_id=?`, actualSize, path, time.Now().Unix(), dialogID, msgID)
 	return err
 }
 
 // MarkAttempt records a failed or unverified attempt. It increments attempts and
-// flips the row to 'failed' once attempts reach maxAttempts, otherwise leaves it
-// 'pending' for another pass.
-func (s *Store) MarkAttempt(msgID int, actualSize int64, errMsg string, maxAttempts int) error {
+// flips the task to 'failed' once attempts reach maxAttempts, otherwise leaves
+// it 'pending' for another pass.
+func (s *Store) MarkAttempt(dialogID int64, msgID int, actualSize int64, errMsg string, maxAttempts int) error {
 	_, err := s.db.Exec(`
-UPDATE downloads SET
+UPDATE tasks SET
     attempts = attempts + 1,
     actual_size = ?,
     error = ?,
     status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END,
     updated_at = ?
-WHERE msg_id = ?`, actualSize, errMsg, maxAttempts, time.Now().Unix(), msgID)
+WHERE dialog_id = ? AND msg_id = ?`, actualSize, errMsg, maxAttempts, time.Now().Unix(), dialogID, msgID)
 	return err
 }
 
-// Attempts returns the attempt count recorded for msgID; ok is false when the
-// message has no download row.
-func (s *Store) Attempts(msgID int) (n int, ok bool, err error) {
-	err = s.db.QueryRow(`SELECT attempts FROM downloads WHERE msg_id = ?`, msgID).Scan(&n)
+// Attempts returns the attempt count recorded for the dialog's message; ok is
+// false when the message has no task row.
+func (s *Store) Attempts(dialogID int64, msgID int) (n int, ok bool, err error) {
+	err = s.db.QueryRow(`SELECT attempts FROM tasks WHERE dialog_id = ? AND msg_id = ?`, dialogID, msgID).Scan(&n)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -487,10 +456,56 @@ func (s *Store) Attempts(msgID int) (n int, ok bool, err error) {
 	return n, true, nil
 }
 
-// Counts returns the number of download rows per status
-// (pending/done/failed) plus "total".
-func (s *Store) Counts() (map[string]int, error) {
-	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM downloads GROUP BY status`)
+// ResetTask flips the dialog's task for msgID back to pending with attempts
+// zeroed and the error cleared, regardless of its prior status. ok is false
+// when no such task row exists.
+func (s *Store) ResetTask(dialogID int64, msgID int) (bool, error) {
+	res, err := s.db.Exec(`
+UPDATE tasks SET status='pending', attempts=0, error=''
+WHERE dialog_id=? AND msg_id=?`, dialogID, msgID)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// CountsByDialog returns a per-dialog rollup of task statuses for every
+// dialog that has tasks, ordered by dialog id.
+func (s *Store) CountsByDialog() ([]DialogCounts, error) {
+	rows, err := s.db.Query(`
+SELECT d.dialog_id, d.username, d.title, d.kind, d.namespace, d.last_msg_id, d.updated_at,
+       COUNT(*),
+       COALESCE(SUM(t.status = 'done'), 0),
+       COALESCE(SUM(t.status = 'pending'), 0),
+       COALESCE(SUM(t.status = 'failed'), 0)
+FROM dialogs d JOIN tasks t ON t.dialog_id = d.dialog_id
+GROUP BY d.dialog_id
+ORDER BY d.dialog_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []DialogCounts
+	for rows.Next() {
+		var dc DialogCounts
+		var total, done, pending, failed int64
+		if err := rows.Scan(&dc.Dialog.DialogID, &dc.Dialog.Username, &dc.Dialog.Title, &dc.Dialog.Kind,
+			&dc.Dialog.Namespace, &dc.Dialog.LastMsgID, &dc.Dialog.UpdatedAt,
+			&total, &done, &pending, &failed); err != nil {
+			return nil, err
+		}
+		dc.Total, dc.Done, dc.Pending, dc.Failed = int(total), int(done), int(pending), int(failed)
+		out = append(out, dc)
+	}
+	return out, rows.Err()
+}
+
+// CountsAll returns task counts per status (pending/done/failed) plus
+// "total", rolled up across every dialog in the archive.
+func (s *Store) CountsAll() (map[string]int, error) {
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM tasks GROUP BY status`)
 	if err != nil {
 		return nil, err
 	}
@@ -511,11 +526,11 @@ func (s *Store) Counts() (map[string]int, error) {
 	return out, rows.Err()
 }
 
-// ListFailed returns permanently failed downloads for reporting.
-func (s *Store) ListFailed() ([]Record, error) {
+// ListFailed returns the dialog's permanently failed tasks for reporting.
+func (s *Store) ListFailed(dialogID int64) ([]Record, error) {
 	rows, err := s.db.Query(`
-SELECT msg_id, dialog_id, file_name, size, media_type, date
-FROM downloads WHERE status='failed' ORDER BY msg_id ASC`)
+SELECT msg_id, file_name, size, media_type
+FROM tasks WHERE dialog_id=? AND status='failed' ORDER BY msg_id ASC`, dialogID)
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +539,7 @@ FROM downloads WHERE status='failed' ORDER BY msg_id ASC`)
 	var out []Record
 	for rows.Next() {
 		var r Record
-		if err := rows.Scan(&r.MsgID, &r.DialogID, &r.FileName, &r.Size, &r.MediaType, &r.Date); err != nil {
+		if err := rows.Scan(&r.MsgID, &r.FileName, &r.Size, &r.MediaType); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -532,10 +547,11 @@ FROM downloads WHERE status='failed' ORDER BY msg_id ASC`)
 	return out, rows.Err()
 }
 
-// ResetFailed flips all failed rows back to pending with attempts zeroed, so a
-// user can force another round after fixing whatever caused the failures.
-func (s *Store) ResetFailed() (int, error) {
-	res, err := s.db.Exec(`UPDATE downloads SET status='pending', attempts=0, error='' WHERE status='failed'`)
+// ResetFailed flips the dialog's failed tasks back to pending with attempts
+// zeroed, so a user can force another round after fixing whatever caused the
+// failures.
+func (s *Store) ResetFailed(dialogID int64) (int, error) {
+	res, err := s.db.Exec(`UPDATE tasks SET status='pending', attempts=0, error='' WHERE dialog_id=? AND status='failed'`, dialogID)
 	if err != nil {
 		return 0, err
 	}
@@ -543,68 +559,52 @@ func (s *Store) ResetFailed() (int, error) {
 	return int(n), nil
 }
 
-// SetMeta stores a key/value metadata pair.
-func (s *Store) SetMeta(key, value string) error {
-	_, err := s.db.Exec(`
-INSERT INTO meta (key, value) VALUES (?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
-	return err
-}
-
-// GetMeta reads a metadata value; ok is false when the key is absent.
-func (s *Store) GetMeta(key string) (value string, ok bool, err error) {
-	err = s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&value)
-	switch err {
-	case sql.ErrNoRows:
-		return "", false, nil
-	case nil:
-		return value, true, nil
-	default:
-		return "", false, err
-	}
-}
-
-// MaxMsgID returns the highest message id in the download manifest, or 0 if
-// empty.
-func (s *Store) MaxMsgID() (int, error) {
-	var id sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MAX(msg_id) FROM downloads`).Scan(&id); err != nil {
-		return 0, err
-	}
-	return int(id.Int64), nil
-}
-
-// metaKeyLastMsgID is the incremental-sync watermark: the highest message id
-// (media or not) seen in any import. Kept separate from the download
-// manifest's max id so a run of newest-are-text-only messages still advances
-// the watermark.
-const metaKeyLastMsgID = "last_msg_id"
-
-// LastMsgID returns the stored incremental watermark, or 0 if never set.
-func (s *Store) LastMsgID() (int, error) {
-	v, ok, err := s.GetMeta(metaKeyLastMsgID)
-	if err != nil || !ok {
-		return 0, err
-	}
-	n, err := strconv.Atoi(v)
+// ResetFailedAll is ResetFailed across every dialog in the archive.
+func (s *Store) ResetFailedAll() (int, error) {
+	res, err := s.db.Exec(`UPDATE tasks SET status='pending', attempts=0, error='' WHERE status='failed'`)
 	if err != nil {
-		return 0, fmt.Errorf("bad %s %q: %w", metaKeyLastMsgID, v, err)
+		return 0, err
 	}
-	return n, nil
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
-// AdvanceLastMsgID raises the watermark to id when id is higher than the current
-// value. Lower or zero ids are ignored, so an empty delta never rewinds it.
-func (s *Store) AdvanceLastMsgID(id int) error {
+// LastMsgID returns the dialog's incremental watermark, or 0 when the dialog
+// is unknown or has never advanced one.
+func (s *Store) LastMsgID(dialogID int64) (int, error) {
+	var id int
+	err := s.db.QueryRow(`SELECT last_msg_id FROM dialogs WHERE dialog_id = ?`, dialogID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// AdvanceLastMsgID raises the dialog's watermark to id when id is higher than
+// the current value. Lower or zero ids are ignored, so an empty delta never
+// rewinds it. An unknown dialog is an error: FK semantics — importing must
+// create the dialog row before advancing its watermark.
+func (s *Store) AdvanceLastMsgID(dialogID int64, id int) error {
 	if id <= 0 {
 		return nil
 	}
-	cur, err := s.LastMsgID()
+	cur, err := s.LastMsgID(dialogID)
 	if err != nil {
 		return err
 	}
 	if id <= cur {
 		return nil
 	}
-	return s.SetMeta(metaKeyLastMsgID, strconv.Itoa(id))
+	res, err := s.db.Exec(`UPDATE dialogs SET last_msg_id=? WHERE dialog_id=?`, id, dialogID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("dialog %d not in state; exporting must create it before advancing the watermark", dialogID)
+	}
+	return nil
 }

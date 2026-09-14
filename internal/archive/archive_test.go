@@ -2,11 +2,13 @@ package archive
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,10 +83,18 @@ func setup(t *testing.T, cfg Config, runner tdlRunner, recs []store.Record) *Arc
 	t.Cleanup(func() { _ = a.Close() })
 	a.runner = runner
 
-	if err := a.store.SetMeta("channel_id", "100"); err != nil {
+	if err := a.store.UpsertDialog(store.Dialog{DialogID: 100}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.store.UpsertManifest(recs); err != nil {
+	// content rows must land before the manifest: tasks reference messages
+	content := make([]store.ContentRecord, len(recs))
+	for i, r := range recs {
+		content[i] = store.ContentRecord{MsgID: r.MsgID, Type: "message"}
+	}
+	if err := a.store.UpsertContent(100, content); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.store.UpsertManifest(100, recs); err != nil {
 		t.Fatal(err)
 	}
 	return a
@@ -93,7 +103,7 @@ func setup(t *testing.T, cfg Config, runner tdlRunner, recs []store.Record) *Arc
 func recsWithSizeEqualsID(ids ...int) []store.Record {
 	var out []store.Record
 	for _, id := range ids {
-		out = append(out, store.Record{MsgID: id, DialogID: 100, Size: int64(id), FileName: "f"})
+		out = append(out, store.Record{MsgID: id, Size: int64(id), FileName: "f"})
 	}
 	return out
 }
@@ -109,7 +119,7 @@ func TestDownloadHappyPath(t *testing.T) {
 	if res.Done != 3 || res.Failed != 0 {
 		t.Errorf("res = %+v, want Done=3 Failed=0", res)
 	}
-	counts, _ := a.store.Counts()
+	counts, _ := a.store.CountsAll()
 	if counts[store.StatusDone] != 3 {
 		t.Errorf("done = %d, want 3", counts[store.StatusDone])
 	}
@@ -134,7 +144,7 @@ func TestDownloadRetriesThenFails(t *testing.T) {
 	if res.Passes != 2 {
 		t.Errorf("passes = %d, want 2 (one retry pass for id 3)", res.Passes)
 	}
-	failed, _ := a.store.ListFailed()
+	failed, _ := a.store.ListFailed(100)
 	if len(failed) != 1 || failed[0].MsgID != 3 {
 		t.Errorf("failed = %+v, want [id 3]", failed)
 	}
@@ -149,11 +159,11 @@ func TestDownloadInfraErrorDoesNotBurnAttempts(t *testing.T) {
 		t.Fatal("expected an error when tdl fails with no progress")
 	}
 	// the message must remain pending with no attempt consumed
-	pending, _ := a.store.ListPending()
+	pending, _ := a.store.ListPending(100)
 	if len(pending) != 1 {
 		t.Fatalf("pending = %d, want 1", len(pending))
 	}
-	counts, _ := a.store.Counts()
+	counts, _ := a.store.CountsAll()
 	if counts[store.StatusFailed] != 0 {
 		t.Errorf("failed = %d, want 0 (infra error must not fail the message)", counts[store.StatusFailed])
 	}
@@ -172,6 +182,55 @@ func TestDownloadCanceledStops(t *testing.T) {
 	}
 	if fake.calls != 0 {
 		t.Errorf("calls = %d, want 0 (should not invoke tdl when already canceled)", fake.calls)
+	}
+}
+
+func TestResolveDialogID(t *testing.T) {
+	fake := &fakeRunner{}
+	a := setup(t, Config{}, fake, nil) // seeds dialog 100
+
+	// a lone dialog is unambiguous
+	id, err := a.resolveDialogID()
+	if err != nil || id != 100 {
+		t.Fatalf("resolveDialogID = %d,%v; want 100,nil", id, err)
+	}
+
+	// a numeric --chat addressing a known dialog wins
+	a.cfg.Chat = "100"
+	if id, err = a.resolveDialogID(); err != nil || id != 100 {
+		t.Fatalf("numeric chat: resolveDialogID = %d,%v; want 100,nil", id, err)
+	}
+
+	// a numeric --chat naming an UNKNOWN dialog is an error even though the
+	// sole dialog could have absorbed it: resolving to the wrong dialog would
+	// sync against the wrong watermark and skip real messages
+	a.cfg.Chat = "999"
+	if _, err = a.resolveDialogID(); err == nil || !strings.Contains(err.Error(), "999") {
+		t.Fatalf("unknown numeric chat: resolveDialogID err = %v; want it naming 999", err)
+	}
+	a.cfg.Chat = ""
+
+	// the cached id of the last import wins even with --chat set elsewhere
+	a.dialogID = 7
+	if id, err = a.resolveDialogID(); err != nil || id != 7 {
+		t.Fatalf("cached id: resolveDialogID = %d,%v; want 7,nil", id, err)
+	}
+
+	// two dialogs and no way to tell them apart is an error naming both
+	a.dialogID = 0
+	a.cfg.Chat = ""
+	if err := a.store.UpsertDialog(store.Dialog{DialogID: 200}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.resolveDialogID()
+	if err == nil || !strings.Contains(err.Error(), "100, 200") {
+		t.Errorf("ambiguous resolveDialogID err = %v; want it listing 100, 200", err)
+	}
+
+	// an empty state names the export remedy
+	a2 := openBare(t, fake)
+	if _, err = a2.resolveDialogID(); err == nil || !strings.Contains(err.Error(), "run export first") {
+		t.Errorf("empty resolveDialogID err = %v; want it pointing at export", err)
 	}
 }
 
@@ -219,11 +278,11 @@ func TestDownloadIdleTimeoutBurnsAttempt(t *testing.T) {
 		t.Fatalf("err = %v, want an error wrapping ErrIdleTimeout", err)
 	}
 	// the stalled message burns one attempt but stays pending
-	pending, _ := a.store.ListPending()
+	pending, _ := a.store.ListPending(100)
 	if len(pending) != 1 {
 		t.Fatalf("pending = %d, want 1", len(pending))
 	}
-	if n, ok, _ := a.store.Attempts(1); !ok || n != 1 {
+	if n, ok, _ := a.store.Attempts(100, 1); !ok || n != 1 {
 		t.Errorf("attempts = %d (ok %v), want 1", n, ok)
 	}
 }
@@ -271,7 +330,7 @@ func TestIdleWatchdogUserCancelNotIdle(t *testing.T) {
 		t.Fatal("Download did not return after cancel")
 	}
 	// a user stop must not burn an attempt
-	if n, ok, _ := a.store.Attempts(1); !ok || n != 0 {
+	if n, ok, _ := a.store.Attempts(100, 1); !ok || n != 0 {
 		t.Errorf("attempts = %d (ok %v), want 0", n, ok)
 	}
 }
@@ -336,8 +395,11 @@ func TestExportIncrementalUsesWatermark(t *testing.T) {
 	fake := &fakeRunner{exportJSON: deltaExportJSON}
 	a := openBare(t, fake)
 
-	// pretend a previous sync reached message 2913
-	if err := a.store.AdvanceLastMsgID(2913); err != nil {
+	// pretend a previous sync of dialog 100 reached message 2913
+	if err := a.store.UpsertDialog(store.Dialog{DialogID: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.store.AdvanceLastMsgID(100, 2913); err != nil {
 		t.Fatal(err)
 	}
 
@@ -356,11 +418,11 @@ func TestExportIncrementalUsesWatermark(t *testing.T) {
 		t.Errorf("added = %d, want 1 (only the photo)", res.Added)
 	}
 	// watermark advances to the newest id seen, including the text message
-	if wm, _ := a.store.LastMsgID(); wm != 2915 {
+	if wm, _ := a.store.LastMsgID(100); wm != 2915 {
 		t.Errorf("watermark = %d, want 2915", wm)
 	}
 	// the new photo is now pending
-	pending, _ := a.store.ListPending()
+	pending, _ := a.store.ListPending(100)
 	if len(pending) != 1 || pending[0].MsgID != 2914 {
 		t.Errorf("pending = %+v, want [2914]", pending)
 	}
@@ -381,7 +443,7 @@ func TestExportIncrementalFallsBackToFull(t *testing.T) {
 	if res.Incremental {
 		t.Error("res.Incremental = true, want false (fell back to full)")
 	}
-	if wm, _ := a.store.LastMsgID(); wm != 2915 {
+	if wm, _ := a.store.LastMsgID(100); wm != 2915 {
 		t.Errorf("watermark = %d, want 2915", wm)
 	}
 }
@@ -396,27 +458,39 @@ func TestImportRecordsContent(t *testing.T) {
 	if _, err := a.Import(path); err != nil {
 		t.Fatal(err)
 	}
+	// the import also created the dialog row for the export's channel id
+	if a.DialogID() != 100 {
+		t.Errorf("DialogID = %d, want 100", a.DialogID())
+	}
 
 	// both the photo and the text-only message get content rows
-	if n, _ := a.store.MessageCount(); n != 2 {
+	if n, _ := a.store.MessageCount(100); n != 2 {
 		t.Fatalf("MessageCount = %d, want 2", n)
 	}
-	photo, ok, err := a.store.ContentMessage(2914)
-	if err != nil || !ok {
-		t.Fatalf("content 2914 = ok %v, err %v; want present", ok, err)
+	db, err := sql.Open("sqlite", a.cfg.dbPath())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if photo.Type != "message" || photo.File != "n.jpg" || photo.Text != "caption" {
-		t.Errorf("content 2914 = %+v, want message/n.jpg/caption", photo)
+	defer func() { _ = db.Close() }()
+	contentRow := func(msgID int) (typ, file, text, raw string) {
+		t.Helper()
+		if err := db.QueryRow(
+			`SELECT type, file, text, raw FROM messages WHERE dialog_id = 100 AND msg_id = ?`, msgID,
+		).Scan(&typ, &file, &text, &raw); err != nil {
+			t.Fatalf("content %d: %v", msgID, err)
+		}
+		return
 	}
-	if len(photo.Raw) == 0 {
+	typ, file, text, raw := contentRow(2914)
+	if typ != "message" || file != "n.jpg" || text != "caption" {
+		t.Errorf("content 2914 = %q/%q/%q, want message/n.jpg/caption", typ, file, text)
+	}
+	if len(raw) == 0 {
 		t.Error("content 2914 raw should be captured")
 	}
-	text, ok, err := a.store.ContentMessage(2915)
-	if err != nil || !ok {
-		t.Fatalf("content 2915 = ok %v, err %v; want present", ok, err)
-	}
-	if text.Text != "text only" || text.File != "" {
-		t.Errorf("content 2915 = %+v, want text-only row", text)
+	typ, file, text, _ = contentRow(2915)
+	if text != "text only" || file != "" {
+		t.Errorf("content 2915 = %q/%q, want a text-only row", text, file)
 	}
 	// a manual import must never delete the file it was given
 	if _, err := os.Stat(path); err != nil {
@@ -436,7 +510,7 @@ func TestExportRemovesFileOnSuccess(t *testing.T) {
 	if _, err := os.Stat(res.File); !os.IsNotExist(err) {
 		t.Errorf("export file %s should be gone after import, stat err = %v", res.File, err)
 	}
-	if n, _ := a.store.MessageCount(); n != 2 {
+	if n, _ := a.store.MessageCount(100); n != 2 {
 		t.Errorf("MessageCount = %d, want 2 (content survives the file)", n)
 	}
 }

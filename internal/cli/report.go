@@ -10,11 +10,15 @@ import (
 	"github.com/myl7/tgxiv/internal/archive"
 )
 
-// writeFailedReport writes the current list of permanently failed messages to a
-// timestamped file under the archive's logs dir. It is a no-op when nothing has
-// failed.
+// writeFailedReport writes the current list of permanently failed messages of
+// the dialog the archive last operated on to a timestamped file under the
+// archive's logs dir. It is a no-op when nothing has failed.
 func writeFailedReport(a *archive.Archive) error {
-	failed, err := a.Store().ListFailed()
+	dialogID := a.DialogID()
+	if dialogID == 0 {
+		return nil // no Import or Download ran; there is no dialog to report on
+	}
+	failed, err := a.Store().ListFailed(dialogID)
 	if err != nil {
 		return err
 	}

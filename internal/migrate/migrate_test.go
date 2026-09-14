@@ -44,17 +44,24 @@ func TestReplayExportsNewestSnapshotWins(t *testing.T) {
 	writeExportFile(t, dir, "weird.txt", replayDayTwoJSON)
 
 	// the photo was already downloaded before the migration: done, with two
-	// attempts burned and a verified path recorded
-	if _, err := a.Store().UpsertManifest([]store.Record{{MsgID: 100, DialogID: 100, FileName: "photo.jpg", Size: 50, MediaType: "photo", Date: 1}}); err != nil {
+	// attempts burned and a verified path recorded. FK order first: the dialog
+	// row, then the content row, then the manifest entry.
+	if err := a.Store().UpsertDialog(store.Dialog{DialogID: 100}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Store().MarkAttempt(100, 0, "boom", 9); err != nil {
+	if err := a.Store().UpsertContent(100, []store.ContentRecord{{MsgID: 100, Type: "message"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Store().MarkAttempt(100, 0, "boom", 9); err != nil {
+	if _, err := a.Store().UpsertManifest(100, []store.Record{{MsgID: 100, FileName: "photo.jpg", Size: 50, MediaType: "photo"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Store().MarkDone(100, 50, "media/100_100_photo.jpg"); err != nil {
+	if err := a.Store().MarkAttempt(100, 100, 0, "boom", 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Store().MarkAttempt(100, 100, 0, "boom", 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Store().MarkDone(100, 100, 50, "media/100_100_photo.jpg"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,40 +74,40 @@ func TestReplayExportsNewestSnapshotWins(t *testing.T) {
 	}
 
 	// the newest snapshot wins for the shared id; the text-only row lands too
-	c, ok, err := a.Store().ContentMessage(100)
-	if err != nil || !ok {
-		t.Fatalf("content 100 = ok %v, err %v; want present", ok, err)
-	}
-	if c.Text != "new caption" {
-		t.Errorf("content 100 text = %q, want %q (day two wins)", c.Text, "new caption")
-	}
-	c, ok, err = a.Store().ContentMessage(101)
-	if err != nil || !ok {
-		t.Fatalf("content 101 = ok %v, err %v; want present", ok, err)
-	}
-	if c.Text != "added later" || c.File != "" {
-		t.Errorf("content 101 = %+v, want a text-only row added by day two", c)
-	}
-
-	// watermark advanced to the highest id seen across all snapshots
-	if wm, _ := a.Store().LastMsgID(); wm != 101 {
-		t.Errorf("watermark = %d, want 101", wm)
-	}
-
-	// the finished download is untouched: still done, same attempts and path
-	db, err := sql.Open("sqlite", filepath.Join(dir, "archive.db"))
+	db, err := sql.Open("sqlite", filepath.Join(dir, "tgxiv.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
+	var text string
+	if err := db.QueryRow(`SELECT text FROM messages WHERE dialog_id = 100 AND msg_id = 100`).Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if text != "new caption" {
+		t.Errorf("content 100 text = %q, want %q (day two wins)", text, "new caption")
+	}
+	var file string
+	if err := db.QueryRow(`SELECT file FROM messages WHERE dialog_id = 100 AND msg_id = 101`).Scan(&file); err != nil {
+		t.Fatal(err)
+	}
+	if file != "" {
+		t.Errorf("content 101 file = %q, want a text-only row added by day two", file)
+	}
+
+	// watermark advanced to the highest id seen across all snapshots
+	if wm, _ := a.Store().LastMsgID(100); wm != 101 {
+		t.Errorf("watermark = %d, want 101", wm)
+	}
+
+	// the finished download is untouched: still done, same attempts and path
 	var status string
 	var attempts int
 	var path string
-	if err := db.QueryRow(`SELECT status, attempts, path FROM downloads WHERE msg_id = 100`).Scan(&status, &attempts, &path); err != nil {
+	if err := db.QueryRow(`SELECT status, attempts, path FROM tasks WHERE dialog_id = 100 AND msg_id = 100`).Scan(&status, &attempts, &path); err != nil {
 		t.Fatal(err)
 	}
 	if status != store.StatusDone || attempts != 2 || path != "media/100_100_photo.jpg" {
-		t.Errorf("download 100 = %s attempts=%d path=%q, want done/2/media/100_100_photo.jpg", status, attempts, path)
+		t.Errorf("task 100 = %s attempts=%d path=%q, want done/2/media/100_100_photo.jpg", status, attempts, path)
 	}
 
 	// snapshots are replayed, not consumed: the files must still be there
@@ -127,7 +134,11 @@ func TestReplayExportsNothingToReplay(t *testing.T) {
 	if files != 0 {
 		t.Errorf("files = %d, want 0", files)
 	}
-	if n, _ := a.Store().MessageCount(); n != 0 {
-		t.Errorf("MessageCount = %d, want 0", n)
+	dialogs, err := a.Store().ListDialogs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dialogs) != 0 {
+		t.Errorf("dialogs = %d, want 0", len(dialogs))
 	}
 }

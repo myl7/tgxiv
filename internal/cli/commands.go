@@ -2,7 +2,8 @@ package cli
 
 import (
 	"fmt"
-	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -160,7 +161,8 @@ func newStatusCmd() *cobra.Command {
 			}
 			defer func() { _ = a.Close() }()
 
-			counts, err := a.Store().Counts()
+			// global rollup across every dialog in the archive
+			counts, err := a.Store().CountsAll()
 			if err != nil {
 				return err
 			}
@@ -169,20 +171,48 @@ func newStatusCmd() *cobra.Command {
 			fmt.Printf("pending: %d\n", counts[store.StatusPending])
 			fmt.Printf("failed:  %d\n", counts[store.StatusFailed])
 
-			failed, err := a.Store().ListFailed()
+			dialogs, err := a.Store().CountsByDialog()
 			if err != nil {
 				return err
 			}
-			if len(failed) > 0 {
-				fmt.Printf("\nfailed messages:\n")
-				sort.Slice(failed, func(i, j int) bool { return failed[i].MsgID < failed[j].MsgID })
-				for _, r := range failed {
-					fmt.Printf("  %d  %s  (%d bytes)\n", r.MsgID, r.FileName, r.Size)
+			for _, dc := range dialogs {
+				fmt.Printf("\ndialog %s\n", dialogLabel(dc.Dialog))
+				fmt.Printf("  total:   %d\n", dc.Total)
+				fmt.Printf("  done:    %d\n", dc.Done)
+				fmt.Printf("  pending: %d\n", dc.Pending)
+				fmt.Printf("  failed:  %d\n", dc.Failed)
+
+				failed, err := a.Store().ListFailed(dc.Dialog.DialogID)
+				if err != nil {
+					return err
+				}
+				if len(failed) > 0 {
+					fmt.Printf("\n  failed messages:\n")
+					// ListFailed is already ordered by msg_id
+					for _, r := range failed {
+						fmt.Printf("  %d  %s  (%d bytes)\n", r.MsgID, r.FileName, r.Size)
+					}
 				}
 			}
 			return nil
 		},
 	}
+}
+
+// dialogLabel renders a dialog header: the id, plus title and @username when
+// known, so a multi-dialog status stays readable while staying grep-friendly.
+func dialogLabel(d store.Dialog) string {
+	var parts []string
+	if d.Title != "" {
+		parts = append(parts, d.Title)
+	}
+	if d.Username != "" {
+		parts = append(parts, "@"+d.Username)
+	}
+	if len(parts) == 0 {
+		return strconv.FormatInt(d.DialogID, 10)
+	}
+	return fmt.Sprintf("%d (%s)", d.DialogID, strings.Join(parts, " "))
 }
 
 func newResetFailedCmd() *cobra.Command {
@@ -196,11 +226,12 @@ func newResetFailedCmd() *cobra.Command {
 			}
 			defer func() { _ = a.Close() }()
 
-			n, err := a.Store().ResetFailed()
+			// every dialog for now; per-chat filtering comes later
+			n, err := a.Store().ResetFailedAll()
 			if err != nil {
 				return err
 			}
-			fmt.Printf("reset %d failed messages to pending\n", n)
+			fmt.Printf("reset %d failed messages to pending (all dialogs)\n", n)
 			return nil
 		},
 	}
