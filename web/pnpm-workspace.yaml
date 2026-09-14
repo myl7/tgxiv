@@ -1,7 +1,3 @@
 allowBuilds:
-  # better-sqlite3 ships prebuilt binaries in prebuilds/ for all supported
-  # platforms and needs no postinstall build; the implicit node-gyp fallback
-  # for its binding.gyp is denied so installs do not require node-gyp.
-  better-sqlite3: false
   sharp: false
   unrs-resolver: false

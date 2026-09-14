@@ -15,3 +15,8 @@
 # web (Next.js)
 web/node_modules/
 web/.next/
+web/out/
+
+# packed viewer export embedded at build time; the placeholder page stays tracked
+internal/webui/dist/*
+!internal/webui/dist/index.html

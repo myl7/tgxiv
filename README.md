@@ -111,6 +111,16 @@ git clone https://github.com/myl7/tgxiv && cd tgxiv && make build
 tgxiv login
 ```
 
+## Build
+
+`make build` produces `bin/tgxiv` with the web viewer embedded: the `web`
+target builds the viewer and packs it into `internal/webui/dist` as
+pre-gzipped files, then the binary is built stripped (`-trimpath` +
+`-ldflags "-s -w"`). Rebuilding the viewer needs Node and pnpm; a plain
+`go build .` works without them and embeds the placeholder page instead — run
+`make web` (`pnpm --dir web build` + `node web/scripts/pack-dist.mjs`) first
+to get the real viewer into the binary.
+
 ## Quickstart
 
 ```sh
@@ -150,6 +160,7 @@ Legacy `TGCA_*` env vars are still honored as fallback.
 | `migrate [FILE...]` | legacy: backfill content from JSON-era snapshots in export/, or import given tdl export JSON files; offline, no tdl call |
 | `status`       | counts (total / done / pending / failed) and the failed list          |
 | `reset-failed` | flip every `failed` message back to `pending` for another try         |
+| `serve`        | serve the bundled web viewer for a channels directory (`--channels`, `--addr`) |
 
 Download tunables (on `archive`, `sync`, `download`):
 

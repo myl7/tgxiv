@@ -58,6 +58,7 @@ func NewRoot() *cobra.Command {
 		newDownloadCmd(),
 		newStatusCmd(),
 		newResetFailedCmd(),
+		newServeCmd(),
 		migrate.New(baseConfig),
 	)
 	return root

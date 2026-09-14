@@ -1,46 +1,53 @@
-import { ChannelMeta, parseChannelDirName } from "@/lib/tdl";
-import { getChannelMeta, listChannelDirs } from "@/lib/server";
+"use client";
+
+import { useEffect, useState } from "react";
+import { ChannelMeta } from "@/lib/tdl";
 import { ClientPage } from "./client-page";
 
-// Render the channel list per request: newly archived channels must appear
-// without a rebuild.
-export const dynamic = "force-dynamic";
+// Fetch the channel list from the Go server on mount: newly archived
+// channels must appear without a rebuild.
+export default function Home() {
 
-export default async function Home() {
+    // null while loading, [] when the fetch failed or returned nothing
+    const [channels, setChannels] = useState<ChannelMeta[] | null>(null);
 
-    let channels: ChannelMeta[] = [];
-    try {
-        const dirNames = await listChannelDirs();
+    useEffect(() => {
+        let cancelled = false;
+        fetch("/api/channels")
+            .then((res) => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json() as Promise<ChannelMeta[]>;
+            })
+            .then((data) => {
+                if (!cancelled) setChannels(Array.isArray(data) ? data : []);
+            })
+            .catch(() => {
+                // server unreachable or bad payload
+                if (!cancelled) setChannels([]);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
-        const results = await Promise.all(
-            dirNames.map(async (dirName) => {
-                const meta = await getChannelMeta(dirName);
-                if (!meta) return null;
-                const { channelName, channelStrId } = parseChannelDirName(dirName);
-                return {
-                    dirName,
-                    channelName,
-                    channelStrId,
-                    channelId: meta.id ?? 0,
-                    messageCount: meta.messageCount,
-                } as ChannelMeta;
-            }),
+    if (channels === null) {
+        return (
+            <div className="flex min-h-screen items-center justify-center bg-[#eee]">
+                <p className="text-gray-500 text-lg">Loading channels…</p>
+            </div>
         );
-
-        channels = results.filter((c): c is ChannelMeta => c !== null);
-        channels.sort((a, b) => a.channelName.localeCompare(b.channelName));
-    } catch {
-        // channels dir missing or unreadable
     }
 
     if (channels.length === 0) {
         return (
             <div className="flex min-h-screen items-center justify-center bg-[#eee]">
                 <p className="text-gray-500 text-lg">
-                    No channels found. Place channel directories in{" "}
+                    No channels found. Serve a channels directory with{" "}
                     <code className="bg-gray-200 px-1 rounded">
-                        {process.env.CHANNELS_DIR || "channels"}/
-                    </code>
+                        tgxiv serve --channels {"<dir>"}
+                    </code>{" "}
+                    and archive channels with{" "}
+                    <code className="bg-gray-200 px-1 rounded">tgxiv archive</code>.
                 </p>
             </div>
         );
