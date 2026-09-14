@@ -182,8 +182,10 @@ Legacy `TGCA_*` env vars are still honored as fallback.
 | `download` (`dl`)    | download the dialog's pending media, verify, retry                            |
 | `migrate [FILE...]`  | legacy: backfill content from JSON-era snapshots in export/, or import given tdl export JSON files; offline, no tdl call |
 | `migrate db <old-dir>` | convert an old one-channel v2 archive directory into a dialog of the root (see Migrating old archives) |
+| `migrate set-dialog <id>` | set/fix a dialog's title/username/kind by hand — the remedy for channels that no longer exist on Telegram (offline) |
 | `status`             | global summary plus a per-dialog block; `--chat` narrows to one dialog        |
 | `reset-failed`       | flip every `failed` task back to `pending` (all dialogs by default; `--chat` scopes to one) |
+| `split`              | move dialogs (rows, media, watermarks) out of this archive root into another via `--to` |
 | `serve`              | serve the bundled web viewer from an archive root via the shared `--dir` (see Web viewer) |
 
 `archive`, `sync`, `manifest`, and `download` each operate on ONE dialog,
@@ -260,9 +262,21 @@ alike — one row each in `dialogs`, one subdirectory each under `media/`. The
 `--dir, -d` flag (env `TGXIV_DIR`) points at this root for every command. Old
 archives are brought into it with `migrate` / `migrate db` (below).
 
+## Splitting an archive root
+
+`tgxiv -d ROOT split --to OTHER_ROOT <dialog_id>...` moves whole dialogs out
+of one archive root into another — rows, media, and sync watermarks together —
+when one root should serve a different purpose (public vs. private, hot vs.
+cold). The destination root is created if absent. Id lists are quote-free:
+each argument may itself be comma-separated, so `111 222` and `"111,222"` are
+the same command. Media folders move first, then a single cross-database
+transaction copies the rows into the destination and deletes them from the
+source — which makes an interrupted run resumable by re-running the same
+command: already-moved dialogs are recognized and skipped.
+
 ## Migrating old archives
 
-Both paths are offline — no tdl call.
+All paths are offline — no tdl call.
 
 - `tgxiv migrate [FILE...]` — unchanged: backfills content from JSON-era export
   snapshots under `export/`, or from tdl export JSON files you pass it, into
@@ -290,6 +304,14 @@ Both paths are offline — no tdl call.
   - the old directory is kept — its `archive.db` is the backup.
 
   v1-era databases must first be upgraded by the previous tgxiv release.
+- `tgxiv migrate set-dialog <dialog_id> [--title t] [--username u]
+  [--kind channel|group|private]` — set or fix one dialog's title, username,
+  or kind by hand, directly in the root's database. The automatic metadata
+  refresh needs the dialog to still exist on Telegram, so a channel deleted
+  there can never be named that way; this is the remedy. In particular,
+  `migrate db`'s `--title`/`--username`/`--kind` can also be set or fixed
+  AFTER the conversion, so old directories can be deleted without losing the
+  chance to name dead channels.
 
 ## Web viewer
 

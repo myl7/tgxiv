@@ -129,5 +129,6 @@ func New(cfg func() (archive.Config, error)) *cobra.Command {
 		},
 	}
 	cmd.AddCommand(newDBCmd(cfg))
+	cmd.AddCommand(newSetDialogCmd(cfg))
 	return cmd
 }
