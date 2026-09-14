@@ -22,37 +22,31 @@ export type ExportMessage = {
 };
 
 export type ExportData = {
+    /** The dialog's id. */
     id: number;
     messages: ExportMessage[];
 };
 
 /** API response for paginated messages. */
 export type MessagesResponse = {
-    channelId: number;
+    dialogId: number;
     messages: ExportMessage[];
     hasMore: boolean;
     oldestId: number | null;
 };
 
-/** Metadata about a channel parsed from its directory and JSON. */
-export type ChannelMeta = {
-    dirName: string;
-    channelName: string;
-    channelStrId?: string;
-    channelId: number;
+/** Metadata about one dialog listed by GET /api/channels. */
+export type DialogMeta = {
+    dialogId: number;
+    title?: string;
+    username?: string;
+    kind: "channel" | "group" | "private" | "";
     messageCount: number;
 };
 
-/** Parse "{channel_name}[_@{channel_str_id}]" directory name. */
-export function parseChannelDirName(dirName: string): {
-    channelName: string;
-    channelStrId?: string;
-} {
-    const match = dirName.match(/^(.+?)_@(.+)$/);
-    if (match) {
-        return { channelName: match[1], channelStrId: match[2] };
-    }
-    return { channelName: dirName };
+/** Human name for a dialog: title, else @username, else #id. */
+export function displayDialogName(d: DialogMeta): string {
+    return d.title || (d.username ? "@" + d.username : "#" + d.dialogId);
 }
 
 export type MediaKind = "image" | "video" | "audio" | "file" | "none";
@@ -64,7 +58,7 @@ export type Entity = {
 };
 
 export type ViewMessage = {
-    channelId: number;
+    dialogId: number;
     msgId: number;
     date: number;
     timeText: string;
@@ -158,9 +152,7 @@ export function formatDateGroup(unixSeconds: number): string {
  * Pre-process raw export messages into ViewMessage objects.
  * Messages are sorted by id ascending (oldest first).
  */
-export function processMessages(data: ExportData, channelDirName: string): ViewMessage[] {
-    const channelId = data.id;
-
+export function processMessages(data: ExportData, dialogId: number): ViewMessage[] {
     const sorted = [...data.messages]
         .filter((m) => m.type === "message")
         .sort((a, b) => a.id - b.id);
@@ -175,15 +167,17 @@ export function processMessages(data: ExportData, channelDirName: string): ViewM
             : mediaKind === "image"
                 ? "image"
                 : previewKindFromDocument(msg.raw);
+        // No file name in the URL: the server resolves the media file by
+        // dialog id + msg id alone.
         const fileUrl = hasFile
-            ? `/${ATTACHMENTS_BASE_PATH}/${encodeURIComponent(channelDirName)}/${channelId}_${msg.id}`
+            ? `/${ATTACHMENTS_BASE_PATH}/${dialogId}/${msg.id}`
             : undefined;
 
         // Extract valid entities
         const entities = extractValidEntities(msg);
 
         return {
-            channelId,
+            dialogId,
             msgId: msg.id,
             date: msg.date,
             timeText: formatTime(msg.date),
