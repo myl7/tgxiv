@@ -14,6 +14,10 @@ export type ExportMessage = {
             Length?: number;
             URL?: string;
         }> | null;
+        Media?: {
+            Photo?: unknown;
+            Document?: { MimeType?: string } | null;
+        } | null;
     } | null;
 };
 
@@ -100,6 +104,22 @@ export function getMediaKind(fileName: string): MediaKind {
     return "file";
 }
 
+/**
+ * Classify media by the message's raw send-type, not the file extension:
+ * a jpeg sent as a document is a file. Telegram's send-type wins;
+ * extension sniffing (getMediaKind) remains only as the no-raw fallback.
+ */
+function mediaKindFromRaw(raw: ExportMessage["raw"], fileName: string): MediaKind {
+    if (raw?.Media?.Photo) return "image";
+    if (raw?.Media?.Document) {
+        const mime = raw.Media.Document.MimeType?.toLowerCase() ?? "";
+        if (mime.startsWith("video/")) return "video";
+        if (mime.startsWith("audio/")) return "audio";
+        return "file"; // documents that are images stay file cards
+    }
+    return getMediaKind(fileName);
+}
+
 function formatDate(d: Date): string {
     const month = String(d.getMonth() + 1).padStart(2, "0");
     const day = String(d.getDate()).padStart(2, "0");
@@ -130,7 +150,7 @@ export function processMessages(data: ExportData, channelDirName: string): ViewM
 
     return sorted.map((msg) => {
         const hasFile = !!msg.file;
-        const mediaKind = hasFile ? getMediaKind(msg.file!) : "none";
+        const mediaKind = hasFile ? mediaKindFromRaw(msg.raw, msg.file!) : "none";
         const fileUrl = hasFile
             ? `/${ATTACHMENTS_BASE_PATH}/${encodeURIComponent(channelDirName)}/${channelId}_${msg.id}`
             : undefined;
