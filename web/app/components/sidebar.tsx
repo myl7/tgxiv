@@ -1,22 +1,28 @@
 "use client";
 
-import { ChannelMeta, getAvatarColor } from "@/lib/tdl";
+import { DialogMeta, displayDialogName, getAvatarColor } from "@/lib/tdl";
 
 interface SidebarProps {
-    channels: ChannelMeta[];
-    selectedChannelId: number;
-    onSelectChannel: (channelId: number) => void;
+    dialogs: DialogMeta[];
+    selectedDialogId: number;
+    onSelectDialog: (dialogId: number) => void;
     open: boolean;
     onClose: () => void;
 }
 
 export function Sidebar({
-    channels,
-    selectedChannelId,
-    onSelectChannel,
+    dialogs,
+    selectedDialogId,
+    onSelectDialog,
     open,
     onClose,
 }: SidebarProps) {
+    // The server orders by dialog id; the sidebar reads better sorted by
+    // whatever name the dialog is displayed as.
+    const sorted = [...dialogs].sort((a, b) =>
+        displayDialogName(a).localeCompare(displayDialogName(b)),
+    );
+
     return (
         <>
             {/* Backdrop overlay for mobile */}
@@ -41,44 +47,54 @@ export function Sidebar({
                     </button>
                 </div>
 
-                {/* Channel list */}
+                {/* Dialog list */}
                 <div className="flex-1 overflow-y-auto">
-                    {channels.map((ch) => (
-                        <button
-                            key={ch.channelId}
-                            onClick={() => onSelectChannel(ch.channelId)}
-                            className={`w-full text-left px-3 py-2.5 flex items-center gap-3 cursor-pointer
-                                transition-colors border-b border-gray-100
-                                ${
-                                    ch.channelId === selectedChannelId
-                                        ? "bg-[#419fd9]/15"
-                                        : "hover:bg-gray-50"
-                                }`}
-                        >
-                            {/* Avatar */}
-                            <div
-                                className="w-[50px] h-[50px] rounded-full flex items-center justify-center text-white font-bold text-lg shrink-0"
-                                style={{ backgroundColor: getAvatarColor(ch.channelId) }}
+                    {sorted.map((d) => {
+                        const name = displayDialogName(d);
+                        return (
+                            <button
+                                key={d.dialogId}
+                                onClick={() => onSelectDialog(d.dialogId)}
+                                className={`w-full text-left px-3 py-2.5 flex items-center gap-3 cursor-pointer
+                                    transition-colors border-b border-gray-100
+                                    ${
+                                        d.dialogId === selectedDialogId
+                                            ? "bg-[#419fd9]/15"
+                                            : "hover:bg-gray-50"
+                                    }`}
                             >
-                                {ch.channelName.charAt(0)}
-                            </div>
+                                {/* Avatar */}
+                                <div
+                                    className="w-[50px] h-[50px] rounded-full flex items-center justify-center text-white font-bold text-lg shrink-0"
+                                    style={{ backgroundColor: getAvatarColor(d.dialogId) }}
+                                >
+                                    {name.charAt(0)}
+                                </div>
 
-                            {/* Channel info */}
-                            <div className="flex-1 min-w-0">
-                                <p className="text-sm font-semibold text-gray-900 truncate">
-                                    {ch.channelName}
-                                </p>
-                                {ch.channelStrId && (
-                                    <p className="text-xs text-gray-400 truncate">
-                                        @{ch.channelStrId}
+                                {/* Dialog info */}
+                                <div className="flex-1 min-w-0">
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                        <p className="text-sm font-semibold text-gray-900 truncate">
+                                            {name}
+                                        </p>
+                                        {d.kind && (
+                                            <span className="text-[10px] leading-tight text-gray-400 border border-gray-200 rounded px-1 py-px shrink-0">
+                                                {d.kind}
+                                            </span>
+                                        )}
+                                    </div>
+                                    {d.title && d.username && (
+                                        <p className="text-xs text-gray-400 truncate">
+                                            @{d.username}
+                                        </p>
+                                    )}
+                                    <p className="text-[11px] text-gray-300">
+                                        ID: {d.dialogId} · {d.messageCount.toLocaleString()} msgs
                                     </p>
-                                )}
-                                <p className="text-[11px] text-gray-300">
-                                    ID: {ch.channelId} · {ch.messageCount.toLocaleString()} msgs
-                                </p>
-                            </div>
-                        </button>
-                    ))}
+                                </div>
+                            </button>
+                        );
+                    })}
                 </div>
             </aside>
         </>

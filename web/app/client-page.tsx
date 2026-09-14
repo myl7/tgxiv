@@ -1,14 +1,14 @@
 "use client";
 
 import { useRef, useState, useEffect, useCallback, useMemo, Fragment } from "react";
-import { ChannelMeta, ExportMessage, ViewMessage, processMessages, formatDateGroup, getAvatarColor } from "@/lib/tdl";
+import { DialogMeta, MessagesResponse, ViewMessage, processMessages, formatDateGroup, getAvatarColor, displayDialogName } from "@/lib/tdl";
 import { MessageBubble } from "./components/message-bubble";
 import { Sidebar } from "./components/sidebar";
 
 const BATCH_SIZE = 50; // how many messages to render at once (local)
 const FETCH_LIMIT = 100; // how many messages to fetch per API call
 
-type ChannelCache = {
+type DialogCache = {
     messages: ViewMessage[];
     hasMore: boolean;
     oldestId: number | null;
@@ -16,18 +16,18 @@ type ChannelCache = {
 };
 
 interface ClientPageProps {
-    channels: ChannelMeta[];
+    dialogs: DialogMeta[];
 }
 
 async function fetchMessages(
-    dirName: string,
+    dialogId: number,
     before?: number | null,
     limit: number = FETCH_LIMIT,
-): Promise<{ channelId: number; messages: ExportMessage[]; hasMore: boolean; oldestId: number | null }> {
+): Promise<MessagesResponse> {
     const params = new URLSearchParams();
     if (before != null) params.set("before", String(before));
     params.set("limit", String(limit));
-    const url = `/api/channels/${encodeURIComponent(dirName)}/messages?${params.toString()}`;
+    const url = `/api/channels/${dialogId}/messages?${params.toString()}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Failed to fetch messages: ${res.status}`);
     return res.json();
@@ -39,26 +39,26 @@ function computeRestoreCount(messages: ViewMessage[], savedMsgId: string): numbe
     return Math.min(messages.length - msgIndex + BATCH_SIZE, messages.length);
 }
 
-export function ClientPage({ channels }: ClientPageProps) {
-    const [selectedChannelId, setSelectedChannelId] = useState(channels[0].channelId);
+export function ClientPage({ dialogs }: ClientPageProps) {
+    const [selectedDialogId, setSelectedDialogId] = useState(dialogs[0].dialogId);
     const [sidebarOpen, setSidebarOpen] = useState(true);
 
-    // Per-channel caches: Map<channelId, ChannelCache>
-    const [channelCaches, setChannelCaches] = useState<Map<number, ChannelCache>>(new Map());
+    // Per-dialog caches: Map<dialogId, DialogCache>
+    const [dialogCaches, setDialogCaches] = useState<Map<number, DialogCache>>(new Map());
 
     // How many messages from the tail of the cache to render
     const [loadedCount, setLoadedCount] = useState(0);
 
-    const selectedChannel = useMemo(
-        () => channels.find((c) => c.channelId === selectedChannelId) ?? channels[0],
-        [channels, selectedChannelId],
+    const selectedDialog = useMemo(
+        () => dialogs.find((d) => d.dialogId === selectedDialogId) ?? dialogs[0],
+        [dialogs, selectedDialogId],
     );
 
-    const cache = channelCaches.get(selectedChannelId);
+    const cache = dialogCaches.get(selectedDialogId);
     const allMessages = cache?.messages ?? [];
     const totalCount = allMessages.length;
     const serverHasMore = cache?.hasMore ?? true;
-    const isChannelLoading = cache?.loading ?? false;
+    const isDialogLoading = cache?.loading ?? false;
 
     const visibleMessages = useMemo(() => {
         const start = Math.max(0, totalCount - loadedCount);
@@ -71,44 +71,43 @@ export function ClientPage({ channels }: ClientPageProps) {
     const prevScrollHeightRef = useRef(0);
     const pendingRestoreRef = useRef<string | null>(null);
     const loadMoreRef = useRef<() => void>(() => {});
-    // Track which channel we're currently restoring scroll for, to avoid stale async work
-    const restoreChannelRef = useRef<number | null>(null);
+    // Track which dialog we're currently restoring scroll for, to avoid stale async work
+    const restoreDialogRef = useRef<number | null>(null);
 
-    // Helper: update a single channel's cache entry
+    // Helper: update a single dialog's cache entry
     const updateCache = useCallback(
-        (channelId: number, updater: (prev: ChannelCache) => ChannelCache) => {
-            setChannelCaches((prev) => {
-                const existing = prev.get(channelId) ?? {
+        (dialogId: number, updater: (prev: DialogCache) => DialogCache) => {
+            setDialogCaches((prev) => {
+                const existing = prev.get(dialogId) ?? {
                     messages: [],
                     hasMore: true,
                     oldestId: null,
                     loading: false,
                 };
                 const next = new Map(prev);
-                next.set(channelId, updater(existing));
+                next.set(dialogId, updater(existing));
                 return next;
             });
         },
         [],
     );
 
-    // Fetch the newest chunk for a channel and optionally restore scroll
-    const initChannel = useCallback(
-        async (channelId: number) => {
-            const meta = channels.find((c) => c.channelId === channelId);
-            if (!meta) return;
+    // Fetch the newest chunk for a dialog and optionally restore scroll
+    const initDialog = useCallback(
+        async (dialogId: number) => {
+            if (!dialogs.some((d) => d.dialogId === dialogId)) return;
 
             // Mark loading
-            updateCache(channelId, (c) => ({ ...c, loading: true }));
+            updateCache(dialogId, (c) => ({ ...c, loading: true }));
 
             try {
-                const result = await fetchMessages(meta.dirName);
+                const result = await fetchMessages(dialogId);
                 const processed = processMessages(
-                    { id: result.channelId, messages: result.messages },
-                    meta.dirName,
+                    { id: result.dialogId, messages: result.messages },
+                    dialogId,
                 );
 
-                updateCache(channelId, () => ({
+                updateCache(dialogId, () => ({
                     messages: processed,
                     hasMore: result.hasMore,
                     oldestId: result.oldestId,
@@ -116,7 +115,7 @@ export function ClientPage({ channels }: ClientPageProps) {
                 }));
 
                 // Set loadedCount for initial display
-                const savedMsgId = localStorage.getItem(`tdl-scroll-${channelId}`);
+                const savedMsgId = localStorage.getItem(`tdl-scroll-${dialogId}`);
                 if (savedMsgId) {
                     const count = computeRestoreCount(processed, savedMsgId);
                     if (count !== null) {
@@ -126,10 +125,9 @@ export function ClientPage({ channels }: ClientPageProps) {
                     }
                     // savedMsgId not found in this chunk; need to fetch older chunks
                     if (result.hasMore) {
-                        restoreChannelRef.current = channelId;
+                        restoreDialogRef.current = dialogId;
                         await restoreScrollByFetching(
-                            meta,
-                            channelId,
+                            dialogId,
                             savedMsgId,
                             processed,
                             result.hasMore,
@@ -141,19 +139,18 @@ export function ClientPage({ channels }: ClientPageProps) {
                 // No saved position or no more data: show newest batch
                 setLoadedCount(Math.min(BATCH_SIZE, processed.length));
             } catch (err) {
-                console.error("Failed to load channel:", err);
-                updateCache(channelId, (c) => ({ ...c, loading: false }));
+                console.error("Failed to load dialog:", err);
+                updateCache(dialogId, (c) => ({ ...c, loading: false }));
             }
         },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [channels, updateCache],
+        [dialogs, updateCache],
     );
 
     // Fetch older chunks until we find the saved message ID
     const restoreScrollByFetching = useCallback(
         async (
-            meta: ChannelMeta,
-            channelId: number,
+            dialogId: number,
             savedMsgId: string,
             currentMessages: ViewMessage[],
             currentHasMore: boolean,
@@ -164,12 +161,12 @@ export function ClientPage({ channels }: ClientPageProps) {
             let oldestId = currentOldestId;
 
             while (hasMore) {
-                if (restoreChannelRef.current !== channelId) return;
+                if (restoreDialogRef.current !== dialogId) return;
 
-                const result = await fetchMessages(meta.dirName, oldestId);
+                const result = await fetchMessages(dialogId, oldestId);
                 const processed = processMessages(
-                    { id: result.channelId, messages: result.messages },
-                    meta.dirName,
+                    { id: result.dialogId, messages: result.messages },
+                    dialogId,
                 );
 
                 olderChunks.unshift(processed);
@@ -179,7 +176,7 @@ export function ClientPage({ channels }: ClientPageProps) {
                 // Only merge when the target message is in this chunk
                 if (processed.some((m) => String(m.msgId) === savedMsgId)) {
                     const accumulated = [...olderChunks.flat(), ...currentMessages];
-                    updateCache(channelId, () => ({
+                    updateCache(dialogId, () => ({
                         messages: accumulated,
                         hasMore,
                         oldestId,
@@ -191,31 +188,31 @@ export function ClientPage({ channels }: ClientPageProps) {
                         setLoadedCount(count);
                         pendingRestoreRef.current = savedMsgId;
                     }
-                    restoreChannelRef.current = null;
+                    restoreDialogRef.current = null;
                     return;
                 }
             }
 
             // Exhausted all messages without finding saved ID
             const accumulated = [...olderChunks.flat(), ...currentMessages];
-            updateCache(channelId, () => ({
+            updateCache(dialogId, () => ({
                 messages: accumulated,
                 hasMore,
                 oldestId,
                 loading: false,
             }));
-            restoreChannelRef.current = null;
+            restoreDialogRef.current = null;
             setLoadedCount(Math.min(BATCH_SIZE, accumulated.length));
         },
         [updateCache],
     );
 
-    // On channel selection change: load from cache or fetch
+    // On dialog selection change: load from cache or fetch
     useEffect(() => {
-        const existing = channelCaches.get(selectedChannelId);
+        const existing = dialogCaches.get(selectedDialogId);
         if (existing && existing.messages.length > 0) {
             // Use cached messages, restore scroll
-            const savedMsgId = localStorage.getItem(`tdl-scroll-${selectedChannelId}`);
+            const savedMsgId = localStorage.getItem(`tdl-scroll-${selectedDialogId}`);
             if (savedMsgId) {
                 const count = computeRestoreCount(existing.messages, savedMsgId);
                 if (count !== null) {
@@ -228,13 +225,13 @@ export function ClientPage({ channels }: ClientPageProps) {
         } else {
             // No cache: fetch
             setLoadedCount(0);
-            initChannel(selectedChannelId);
+            initDialog(selectedDialogId);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [selectedChannelId]);
+    }, [selectedDialogId]);
 
     const saveScrollPosition = useCallback(
-        (channelId: number) => {
+        (dialogId: number) => {
             const container = scrollContainerRef.current;
             if (!container) return;
 
@@ -251,7 +248,7 @@ export function ClientPage({ channels }: ClientPageProps) {
                 }
             }
             if (lastVisibleMsgId) {
-                localStorage.setItem(`tdl-scroll-${channelId}`, lastVisibleMsgId);
+                localStorage.setItem(`tdl-scroll-${dialogId}`, lastVisibleMsgId);
             }
         },
         [],
@@ -266,8 +263,8 @@ export function ClientPage({ channels }: ClientPageProps) {
 
         // No pagination before the first page lands: without a cached page the
         // oldestId cursor is null, which would re-fetch the newest page and duplicate it.
-        const existing = channelCaches.get(selectedChannelId);
-        if (isChannelLoading || !existing || existing.messages.length === 0) return;
+        const existing = dialogCaches.get(selectedDialogId);
+        if (isDialogLoading || !existing || existing.messages.length === 0) return;
 
         const container = scrollContainerRef.current;
         if (container) {
@@ -280,27 +277,27 @@ export function ClientPage({ channels }: ClientPageProps) {
             setLoadedCount((prev) => Math.min(prev + BATCH_SIZE, totalCount));
         } else if (serverHasMore) {
             // Fetch next chunk from API
-            const meta = channels.find((c) => c.channelId === selectedChannelId);
+            const known = dialogs.some((d) => d.dialogId === selectedDialogId);
             const currentOldestId = existing.oldestId;
-            if (!meta || currentOldestId == null) return;
+            if (!known || currentOldestId == null) return;
 
             isLoadingRef.current = true;
 
-            fetchMessages(meta.dirName, currentOldestId).then((result) => {
+            fetchMessages(selectedDialogId, currentOldestId).then((result) => {
                 const processed = processMessages(
-                    { id: result.channelId, messages: result.messages },
-                    meta.dirName,
+                    { id: result.dialogId, messages: result.messages },
+                    selectedDialogId,
                 );
 
                 const existingIds = new Set(existing.messages.map((m) => m.msgId));
                 const fresh = processed.filter((m) => !existingIds.has(m.msgId));
 
-                setChannelCaches((prev) => {
-                    const current = prev.get(selectedChannelId);
+                setDialogCaches((prev) => {
+                    const current = prev.get(selectedDialogId);
                     if (!current) return prev;
                     const merged = [...fresh, ...current.messages];
                     const next = new Map(prev);
-                    next.set(selectedChannelId, {
+                    next.set(selectedDialogId, {
                         messages: merged,
                         hasMore: result.hasMore,
                         oldestId: result.oldestId,
@@ -317,7 +314,7 @@ export function ClientPage({ channels }: ClientPageProps) {
                 isLoadingRef.current = false;
             });
         }
-    }, [hasMore, hasMoreLocal, serverHasMore, isChannelLoading, totalCount, channels, selectedChannelId, channelCaches]);
+    }, [hasMore, hasMoreLocal, serverHasMore, isDialogLoading, totalCount, dialogs, selectedDialogId, dialogCaches]);
 
     useEffect(() => {
         loadMoreRef.current = loadMore;
@@ -350,17 +347,17 @@ export function ClientPage({ channels }: ClientPageProps) {
         isLoadingRef.current = false;
     }, [loadedCount]);
 
-    // Scroll to bottom on initial mount and channel switch (when no saved position)
+    // Scroll to bottom on initial mount and dialog switch (when no saved position)
     useEffect(() => {
         if (pendingRestoreRef.current) return;
-        if (isChannelLoading) return;
+        if (isDialogLoading) return;
         requestAnimationFrame(() => {
             const container = scrollContainerRef.current;
             if (container) {
                 container.scrollTop = container.scrollHeight;
             }
         });
-    }, [selectedChannelId, isChannelLoading]);
+    }, [selectedDialogId, isDialogLoading]);
 
     // Track whether user is near the bottom of the scroll container
     const [isAtBottom, setIsAtBottom] = useState(true);
@@ -376,7 +373,7 @@ export function ClientPage({ channels }: ClientPageProps) {
 
         container.addEventListener("scroll", handleScroll, { passive: true });
         return () => container.removeEventListener("scroll", handleScroll);
-    }, [selectedChannelId]);
+    }, [selectedDialogId]);
 
     const scrollToBottom = useCallback(() => {
         const container = scrollContainerRef.current;
@@ -388,11 +385,11 @@ export function ClientPage({ channels }: ClientPageProps) {
     // Save scroll position on page unload
     useEffect(() => {
         const handleBeforeUnload = () => {
-            saveScrollPosition(selectedChannelId);
+            saveScrollPosition(selectedDialogId);
         };
         window.addEventListener("beforeunload", handleBeforeUnload);
         return () => window.removeEventListener("beforeunload", handleBeforeUnload);
-    }, [selectedChannelId, saveScrollPosition]);
+    }, [selectedDialogId, saveScrollPosition]);
 
     // IntersectionObserver for the sentinel at the top
     useEffect(() => {
@@ -416,7 +413,7 @@ export function ClientPage({ channels }: ClientPageProps) {
         observer.observe(sentinel);
         return () => observer.disconnect();
         // Reconnect only when sentinel/container may have changed
-    }, [selectedChannelId]);
+    }, [selectedDialogId]);
 
     // Group messages by date
     const groupedMessages = useMemo(() => {
@@ -436,21 +433,21 @@ export function ClientPage({ channels }: ClientPageProps) {
         return groups;
     }, [visibleMessages]);
 
-    const handleSelectChannel = useCallback(
-        (newChannelId: number) => {
-            saveScrollPosition(selectedChannelId);
-            setSelectedChannelId(newChannelId);
+    const handleSelectDialog = useCallback(
+        (newDialogId: number) => {
+            saveScrollPosition(selectedDialogId);
+            setSelectedDialogId(newDialogId);
         },
-        [selectedChannelId, saveScrollPosition],
+        [selectedDialogId, saveScrollPosition],
     );
 
     return (
         <div className="flex h-dvh bg-[#8ba0b5]">
             {/* Sidebar */}
             <Sidebar
-                channels={channels}
-                selectedChannelId={selectedChannelId}
-                onSelectChannel={handleSelectChannel}
+                dialogs={dialogs}
+                selectedDialogId={selectedDialogId}
+                onSelectDialog={handleSelectDialog}
                 open={sidebarOpen}
                 onClose={() => setSidebarOpen(false)}
             />
@@ -484,17 +481,17 @@ export function ClientPage({ channels }: ClientPageProps) {
                     <div
                         className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold text-lg shrink-0"
                         style={{
-                            backgroundColor: getAvatarColor(selectedChannel.channelId),
+                            backgroundColor: getAvatarColor(selectedDialog.dialogId),
                         }}
                     >
-                        {selectedChannel.channelName.charAt(0)}
+                        {displayDialogName(selectedDialog).charAt(0)}
                     </div>
                     <div className="min-w-0">
                         <h1 className="text-lg font-semibold leading-tight truncate">
-                            {selectedChannel.channelName}
+                            {displayDialogName(selectedDialog)}
                         </h1>
                         <p className="text-xs text-blue-100 opacity-80">
-                            {selectedChannel.messageCount.toLocaleString()} messages
+                            {selectedDialog.messageCount.toLocaleString()} messages
                         </p>
                     </div>
                 </header>
@@ -512,7 +509,7 @@ export function ClientPage({ channels }: ClientPageProps) {
                             {/* Sentinel for infinite scroll (top) */}
                             <div ref={sentinelRef} className="h-1" />
 
-                            {isChannelLoading && totalCount === 0 && (
+                            {isDialogLoading && totalCount === 0 && (
                                 <div className="text-center py-12">
                                     <span className="text-sm text-white/70 bg-black/10 rounded-full px-4 py-2">
                                         Loading messages...
@@ -520,7 +517,7 @@ export function ClientPage({ channels }: ClientPageProps) {
                                 </div>
                             )}
 
-                            {hasMore && !isChannelLoading && (
+                            {hasMore && !isDialogLoading && (
                                 <div className="text-center py-3">
                                     <span className="text-xs text-white/60 bg-black/10 rounded-full px-3 py-1">
                                         Loading older messages...

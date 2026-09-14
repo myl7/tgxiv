@@ -8,7 +8,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,39 +17,37 @@ import (
 )
 
 const (
-	archiveDBName = "archive.db"
+	archiveDBName = "tgxiv.sqlite"
 	mediaDirName  = "media"
 
 	defaultPageLimit = 100
 	maxPageLimit     = 1000
 )
 
-// messagesSQL pages content messages newest-first. before = 0 means from the
-// newest; the ? = 0 arm lets one statement serve both first and later pages.
+// messagesSQL pages one dialog's content messages newest-first. before = 0
+// means from the newest; the ? = 0 arm lets one statement serve both first
+// and later pages.
 const messagesSQL = `
 SELECT msg_id AS id, type, date, file, text, raw
 FROM messages
-WHERE type = 'message' AND (? = 0 OR msg_id < ?)
+WHERE dialog_id = ? AND type = 'message' AND (? = 0 OR msg_id < ?)
 ORDER BY msg_id DESC
 LIMIT ?`
 
-// channelDirRe splits "<name>_@<id>" channel dir names.
-var channelDirRe = regexp.MustCompile(`^(.+?)_@(.+)$`)
-
-// downloadNameRe matches tdl's "<channelId>_<msgId>_" file naming, which every
-// /downloads URL must carry to be resolvable.
-var downloadNameRe = regexp.MustCompile(`^([0-9]+)_([0-9]+)`)
+// msgIDRe matches the msg id leading the last segment of every resolvable
+// /downloads file name: a bare "<msgId>" or a "<msgId>_<anything>" form.
+var msgIDRe = regexp.MustCompile(`^([0-9]+)(?:_|$)`)
 
 // errNotResolvable marks a /downloads URL that maps to no media file.
 var errNotResolvable = errors.New("media file not resolvable")
 
-// Channel is one channel archive under the channels root dir.
-type Channel struct {
-	DirName      string `json:"dirName"`
-	ChannelName  string `json:"channelName"`
-	ChannelStrID string `json:"channelStrId,omitempty"` // absent when the dir name has no _@<id> part
-	ChannelID    int64  `json:"channelId"`              // meta channel_id, 0 when missing or invalid
-	MessageCount int    `json:"messageCount"`           // every content row, service messages included
+// Dialog is one dialog recorded in the archive root's tgxiv.sqlite.
+type Dialog struct {
+	DialogID     int64  `json:"dialogId"`
+	Title        string `json:"title,omitempty"`
+	Username     string `json:"username,omitempty"` // no '@' prefix; absent when unknown
+	Kind         string `json:"kind"`
+	MessageCount int    `json:"messageCount"` // every content row, service messages included
 }
 
 // message is one row of a messages page. text and file are omitted when the
@@ -65,56 +62,53 @@ type message struct {
 	Raw  json.RawMessage `json:"raw"`
 }
 
-// messagesResponse is one page of GET /api/channels/{dir}/messages.
+// messagesResponse is one page of GET /api/channels/{id}/messages.
 type messagesResponse struct {
-	ChannelID int64     `json:"channelId"`
-	Messages  []message `json:"messages"`
-	HasMore   bool      `json:"hasMore"`
-	OldestID  *int64    `json:"oldestId"` // messages[0].id, null on an empty page
+	DialogID int64     `json:"dialogId"`
+	Messages []message `json:"messages"`
+	HasMore  bool      `json:"hasMore"`
+	OldestID *int64    `json:"oldestId"` // messages[0].id, null on an empty page
 }
 
 // server is the viewer state shared by every handler.
 type server struct {
-	channelsDir string
-	cache       *dbCache
+	root  string
+	cache *dbCache
 }
 
-func newServer(channelsDir string) *server {
-	return &server{
-		channelsDir: channelsDir,
-		cache:       &dbCache{channelsDir: channelsDir, entries: map[string]*cachedDB{}},
-	}
+func newServer(root string) *server {
+	return &server{root: root, cache: &dbCache{root: root}}
 }
 
-// cachedDB is a read-only handle to one channel's archive.db plus the meta
-// channel_id parsed at open; both are reused until the file's mtime moves.
+// cachedDB is a read-only handle to the archive root's tgxiv.sqlite, reused
+// until the file's mtime moves.
 type cachedDB struct {
-	db        *sql.DB
-	modTime   time.Time
-	channelID int64
+	db      *sql.DB
+	modTime time.Time
 }
 
-// dbCache holds one cachedDB per channel dir. The archiver may rewrite
-// archive.db while the viewer runs, so a handle whose mtime moved is replaced;
-// the read-only WAL connection never blocks the writer meanwhile.
+// dbCache caches the one read-only handle to <root>/tgxiv.sqlite. The
+// archiver may keep writing the db while the viewer runs, so a handle whose
+// mtime moved is replaced; the read-only WAL connection never blocks the
+// writer meanwhile.
 type dbCache struct {
-	channelsDir string
-	mu          sync.Mutex
-	entries     map[string]*cachedDB
+	root  string
+	mu    sync.Mutex
+	entry *cachedDB
 }
 
-// get returns the cached handle for dir, reopening the db when its mtime
-// changed. Replaced handles are closed after unlocking: sql.DB.Close waits
-// for in-flight queries first, so a reader never touches a closed handle.
-func (c *dbCache) get(dir string) (*cachedDB, error) {
-	dbPath := filepath.Join(c.channelsDir, dir, archiveDBName)
+// get returns the cached handle, reopening the db when its mtime changed.
+// A replaced handle is closed after unlocking: sql.DB.Close waits for
+// in-flight queries first, so a reader never touches a closed handle.
+func (c *dbCache) get() (*cachedDB, error) {
+	dbPath := filepath.Join(c.root, archiveDBName)
 	fi, err := os.Stat(dbPath)
 	if err != nil {
 		return nil, err
 	}
 
 	c.mu.Lock()
-	e := c.entries[dir]
+	e := c.entry
 	if e != nil && e.modTime.Equal(fi.ModTime()) {
 		c.mu.Unlock()
 		return e, nil
@@ -125,7 +119,7 @@ func (c *dbCache) get(dir string) (*cachedDB, error) {
 		if e != nil {
 			old = e.db
 		}
-		c.entries[dir] = fresh
+		c.entry = fresh
 	}
 	c.mu.Unlock()
 
@@ -138,19 +132,18 @@ func (c *dbCache) get(dir string) (*cachedDB, error) {
 	return fresh, nil
 }
 
-// close closes every cached handle.
+// close closes the cached handle.
 func (c *dbCache) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for dir, e := range c.entries {
-		_ = e.db.Close()
-		delete(c.entries, dir)
+	if c.entry != nil {
+		_ = c.entry.db.Close()
+		c.entry = nil
 	}
 }
 
-// openArchiveDB opens archive.db read-only (busy_timeout absorbs any lock
-// contention with the archiver) and parses the meta channel_id, which is
-// stable for the life of the handle.
+// openArchiveDB opens the archive's tgxiv.sqlite read-only; busy_timeout
+// absorbs any lock contention with the archiver.
 func openArchiveDB(dbPath string, modTime time.Time) (*cachedDB, error) {
 	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(3000)")
 	if err != nil {
@@ -161,88 +154,72 @@ func openArchiveDB(dbPath string, modTime time.Time) (*cachedDB, error) {
 		_ = db.Close()
 		return nil, err
 	}
-
-	e := &cachedDB{db: db, modTime: modTime}
-	var v string
-	switch err := db.QueryRow(`SELECT value FROM meta WHERE key = 'channel_id'`).Scan(&v); {
-	case err == nil:
-		if id, perr := strconv.ParseInt(v, 10, 64); perr == nil {
-			e.channelID = id
-		}
-	case err == sql.ErrNoRows:
-		// no channel_id recorded; the response falls back to 0
-	default:
-		_ = db.Close()
-		return nil, err
-	}
-	return e, nil
+	return &cachedDB{db: db, modTime: modTime}, nil
 }
 
-// listChannels lists the channel archives under the root dir, sorted by
-// channel name. A dir only counts as a channel when its archive.db opens and
-// reads; anything else is skipped silently.
-func (s *server) listChannels() ([]Channel, error) {
-	des, err := os.ReadDir(s.channelsDir)
+// listDialogs lists the dialogs recorded in the archive root's tgxiv.sqlite,
+// ascending by dialog id.
+func (s *server) listDialogs() ([]Dialog, error) {
+	e, err := s.cache.get()
 	if err != nil {
 		return nil, err
 	}
-
-	chs := []Channel{}
-	for _, de := range des {
-		// only real subdirs; a symlinked dir is not a channel
-		if !de.IsDir() {
-			continue
-		}
-		e, err := s.cache.get(de.Name())
-		if err != nil {
-			continue
-		}
-		n, err := e.messageCount()
-		if err != nil {
-			continue
-		}
-
-		ch := Channel{
-			DirName:      de.Name(),
-			ChannelName:  de.Name(),
-			ChannelID:    e.channelID,
-			MessageCount: n,
-		}
-		if m := channelDirRe.FindStringSubmatch(de.Name()); m != nil {
-			ch.ChannelName = m[1]
-			ch.ChannelStrID = m[2]
-		}
-		chs = append(chs, ch)
+	rows, err := e.db.Query(`
+SELECT d.dialog_id, d.username, d.title, d.kind,
+       (SELECT COUNT(*) FROM messages m WHERE m.dialog_id = d.dialog_id)
+FROM dialogs d ORDER BY d.dialog_id`)
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(chs, func(i, j int) bool { return chs[i].ChannelName < chs[j].ChannelName })
-	return chs, nil
+	defer func() { _ = rows.Close() }()
+
+	ds := []Dialog{}
+	for rows.Next() {
+		var d Dialog
+		if err := rows.Scan(&d.DialogID, &d.Username, &d.Title, &d.Kind, &d.MessageCount); err != nil {
+			return nil, err
+		}
+		ds = append(ds, d)
+	}
+	return ds, rows.Err()
 }
 
-// CountChannels reports how many channel archives sit under channelsDir, for
-// the serve command's startup banner.
-func CountChannels(channelsDir string) (int, error) {
-	s := newServer(channelsDir)
+// CountDialogs reports how many dialogs the archive root's tgxiv.sqlite
+// records, for the serve command's startup banner. A missing db is an empty
+// archive, not an error.
+func CountDialogs(root string) (int, error) {
+	s := newServer(root)
 	defer s.cache.close()
-	chs, err := s.listChannels()
+	ds, err := s.listDialogs()
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
-	return len(chs), nil
+	return len(ds), nil
 }
 
-// messageCount counts every content row, service messages included — the
-// viewer's channel list shows the archive size, not the pageable subset.
-func (e *cachedDB) messageCount() (int, error) {
-	var n int
-	err := e.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n)
-	return n, err
+// dialogExists reports whether the dialogs table records id; unknown dialogs
+// 404 instead of paging as an empty channel.
+func (e *cachedDB) dialogExists(id int64) (bool, error) {
+	var one int
+	err := e.db.QueryRow(`SELECT 1 FROM dialogs WHERE dialog_id = ?`, id).Scan(&one)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
-// messages returns one page of content messages ascending by id, plus whether
-// older messages remain. It fetches limit+1 newest-first rows to compute
-// hasMore, drops the extra, and reverses the kept rows.
-func (e *cachedDB) messages(before int64, limit int) ([]message, bool, error) {
-	rows, err := e.db.Query(messagesSQL, before, before, limit+1)
+// messages returns one page of a dialog's content messages ascending by id,
+// plus whether older messages remain. It fetches limit+1 newest-first rows to
+// compute hasMore, drops the extra, and reverses the kept rows.
+func (e *cachedDB) messages(dialogID, before int64, limit int) ([]message, bool, error) {
+	rows, err := e.db.Query(messagesSQL, dialogID, before, before, limit+1)
 	if err != nil {
 		return nil, false, err
 	}
@@ -283,25 +260,30 @@ func rawJSON(raw string) json.RawMessage {
 	return json.RawMessage(raw)
 }
 
-// resolveMedia locates the media file behind a /downloads/<dir>/<rest> URL
-// whose last segment starts "<channelId>_<msgId>" (tdl's naming). The done
-// download row's path is tried first — only its basename is meaningful, and
-// it must resolve to a regular file inside media/, which blocks stored
-// traversal paths. Failing that, media/ is scanned for the
-// "<channelId>_<msgId>_" prefix.
-func (s *server) resolveMedia(dir, last string) (string, error) {
-	m := downloadNameRe.FindStringSubmatch(last)
+// resolveMedia locates the media file behind a /downloads/<dialogId>/<rest>
+// URL. The last rest segment must lead with the msg id — a bare "<msgId>" or
+// a "<msgId>_<anything>" name. The done task row's root-relative path is
+// tried first — only its basename is meaningful, joined into
+// media/<dialogId>/ where it must resolve to a regular file, which blocks
+// stored traversal paths. Failing that, media/<dialogId>/ is scanned for the
+// "<msgId>_" prefix, whose trailing underscore keeps msg 1 from matching
+// msg 10's files.
+func (s *server) resolveMedia(dialogID int64, last string) (string, error) {
+	m := msgIDRe.FindStringSubmatch(last)
 	if m == nil {
 		return "", errNotResolvable
 	}
-	channelStr, msgStr := m[1], m[2]
-	msgID, _ := strconv.ParseInt(msgStr, 10, 64)
-	mediaDir := filepath.Join(s.channelsDir, dir, mediaDirName)
+	msgID, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return "", errNotResolvable
+	}
+	mediaDir := filepath.Join(s.root, mediaDirName, strconv.FormatInt(dialogID, 10))
 
-	if e, err := s.cache.get(dir); err == nil {
+	if e, err := s.cache.get(); err == nil {
 		var stored string
 		err := e.db.QueryRow(`
-SELECT path FROM downloads WHERE msg_id = ? AND status = 'done' AND path <> ''`, msgID).Scan(&stored)
+SELECT path FROM tasks WHERE dialog_id = ? AND msg_id = ? AND status = 'done' AND path <> ''`,
+			dialogID, msgID).Scan(&stored)
 		if err == nil {
 			p := filepath.Join(mediaDir, path.Base(strings.ReplaceAll(stored, `\`, "/")))
 			if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
@@ -310,7 +292,7 @@ SELECT path FROM downloads WHERE msg_id = ? AND status = 'done' AND path <> ''`,
 		}
 	}
 
-	prefix := channelStr + "_" + msgStr + "_"
+	prefix := strconv.FormatInt(msgID, 10) + "_"
 	des, err := os.ReadDir(mediaDir)
 	if err != nil {
 		return "", errNotResolvable

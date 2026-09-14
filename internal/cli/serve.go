@@ -13,24 +13,25 @@ import (
 	"github.com/myl7/tgxiv/internal/webui"
 )
 
-// newServeCmd serves the bundled web viewer. It takes a channels root dir —
-// the parent of the archive dirs — so it uses its own --channels flag rather
-// than the shared --dir, which everywhere else means a single archive dir.
+// newServeCmd serves the bundled web viewer. It takes the archive root —
+// the dir holding tgxiv.sqlite and media/ — via the shared --dir flag,
+// since the single-db model gives the viewer and the archiver the same
+// view of one dir.
 func newServeCmd() *cobra.Command {
-	var channels, addr string
+	var addr string
 
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Serve the bundled web viewer for a channels directory",
+		Short: "Serve the bundled web viewer for an archive directory",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dir := envOr(channels, []string{"TGXIV_CHANNELS"}, "channels")
+			dir := envOr(flagDir, []string{"TGXIV_DIR"}, "channels")
 			listen := envOr(addr, []string{"TGXIV_ADDR"}, "127.0.0.1:8080")
 
-			n, err := webui.CountChannels(dir)
+			n, err := webui.CountDialogs(dir)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "tgxiv: listing channels: %v\n", err)
+				fmt.Fprintf(os.Stderr, "tgxiv: listing dialogs: %v\n", err)
 			}
-			fmt.Printf("tgxiv: serving %d channel(s) from %s at http://%s\n", n, dir, listen)
+			fmt.Printf("tgxiv: serving %d dialog(s) from %s at http://%s\n", n, dir, listen)
 
 			srv := &http.Server{
 				Addr:    listen,
@@ -60,7 +61,6 @@ func newServeCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&channels, "channels", "", "channels root directory, parent of the archive dirs (env TGXIV_CHANNELS, default \"channels\")")
 	cmd.Flags().StringVar(&addr, "addr", "", "listen address (env TGXIV_ADDR, default \"127.0.0.1:8080\")")
 	return cmd
 }

@@ -1,7 +1,8 @@
-// Package webui serves the archive viewer over a channels root directory:
-// the JSON API reads each channel dir's archive.db read-only (so the archiver
-// can keep writing while the viewer runs), media files stream from media/,
-// and the static export is embedded pre-gzipped at build time.
+// Package webui serves the archive viewer over one archive root directory:
+// the JSON API reads the root's single tgxiv.sqlite read-only (so the
+// archiver can keep writing while the viewer runs), media files stream from
+// media/<dialogId>/, and the static export is embedded pre-gzipped at build
+// time.
 package webui
 
 import (
@@ -39,35 +40,35 @@ var distRoot = func() fs.FS {
 // unchanging name, so caches may keep them forever.
 const immutableCacheControl = "public, max-age=31536000, immutable"
 
-// New builds the viewer handler for a channels root directory: every subdir
-// that holds an archive.db is served as a channel.
-func New(channelsDir string) http.Handler {
-	s := newServer(channelsDir)
+// New builds the viewer handler for an archive root directory: the dir that
+// holds tgxiv.sqlite and the per-dialog media/ tree.
+func New(root string) http.Handler {
+	s := newServer(root)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/channels", s.handleChannels)
-	mux.HandleFunc("GET /api/channels/{dir}/messages", s.handleMessages)
-	mux.HandleFunc("GET /downloads/{dir}/{rest...}", s.handleDownload)
+	mux.HandleFunc("GET /api/channels/{id}/messages", s.handleMessages)
+	mux.HandleFunc("GET /downloads/{id}/{rest...}", s.handleDownload)
 	mux.HandleFunc("GET /", s.handleStatic)
 	return mux
 }
 
-// handleChannels lists the channel archives under the root dir. A missing or
-// unreadable root is an empty listing, not an error: the viewer should still
-// come up.
+// handleChannels lists the dialogs recorded in the archive root. A missing
+// or unreadable db is an empty listing, not an error: the viewer should
+// still come up.
 func (s *server) handleChannels(w http.ResponseWriter, r *http.Request) {
-	chs, err := s.listChannels()
+	ds, err := s.listDialogs()
 	if err != nil {
-		chs = []Channel{}
+		ds = []Dialog{}
 	}
-	writeJSON(w, http.StatusOK, chs)
+	writeJSON(w, http.StatusOK, ds)
 }
 
-// handleMessages pages one channel's messages oldest-to-newest; before = 0
-// starts from the newest.
+// handleMessages pages one dialog's messages oldest-to-newest; before = 0
+// starts from the newest. The {id} path value is the numeric dialog id.
 func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	dir := r.PathValue("dir")
-	if hasTraversal(dir) {
-		writeJSONError(w, http.StatusForbidden, "Forbidden")
+	id, ok := parseDialogID(r.PathValue("id"))
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "Not found")
 		return
 	}
 	before := int64(queryInt(r, "before", 0))
@@ -78,18 +79,23 @@ func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		limit = maxPageLimit
 	}
 
-	e, err := s.cache.get(dir)
+	e, err := s.cache.get()
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, "Not found")
 		return
 	}
-	msgs, hasMore, err := e.messages(before, limit)
+	exists, err := e.dialogExists(id)
+	if err != nil || !exists {
+		writeJSONError(w, http.StatusNotFound, "Not found")
+		return
+	}
+	msgs, hasMore, err := e.messages(id, before, limit)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, "Not found")
 		return
 	}
 
-	resp := messagesResponse{ChannelID: e.channelID, Messages: msgs, HasMore: hasMore}
+	resp := messagesResponse{DialogID: id, Messages: msgs, HasMore: hasMore}
 	if len(msgs) > 0 {
 		oldest := msgs[0].ID
 		resp.OldestID = &oldest
@@ -97,19 +103,21 @@ func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleDownload serves one media file: /downloads/<dir>/<channelId>_<msgId>_<name>.
-// Anything unresolvable is a plain-text 404.
+// handleDownload serves one media file:
+// /downloads/<dialogId>/<msgId>[_<name>]. Anything unresolvable is a
+// plain-text 404.
 func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	dir, rest := r.PathValue("dir"), r.PathValue("rest")
-	if hasTraversal(dir) {
+	id, ok := parseDialogID(r.PathValue("id"))
+	if !ok {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
 	}
+	rest := r.PathValue("rest")
 	last := rest
 	if i := strings.LastIndex(rest, "/"); i >= 0 {
 		last = rest[i+1:]
 	}
-	p, err := s.resolveMedia(dir, last)
+	p, err := s.resolveMedia(id, last)
 	if err != nil {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
@@ -258,10 +266,19 @@ func mediaContentType(name string) string {
 	return "application/octet-stream"
 }
 
-// hasTraversal reports whether a path value carries separators or parent
-// references, i.e. anything that could escape the channels root.
-func hasTraversal(s string) bool {
-	return strings.Contains(s, "/") || strings.Contains(s, `\`) || strings.Contains(s, "..")
+// parseDialogID parses the numeric {id} path value. Dialog ids are bare
+// integers, so anything non-numeric is rejected outright — this replaces the
+// old traversal check on free-form channel dir names by never letting an
+// unparseable value near the filesystem.
+func parseDialogID(id string) (int64, bool) {
+	if id == "" || strings.Trim(id, "0123456789") != "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // queryInt reads an int query parameter, falling back to def when absent or
