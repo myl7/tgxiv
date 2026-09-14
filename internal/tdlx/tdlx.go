@@ -7,17 +7,22 @@ package tdlx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 )
 
 // Runner launches a specific tdl binary under a fixed session namespace.
 type Runner struct {
-	// Bin is the tdl executable (a path, or a name resolved on PATH).
+	// Bin is the tdl executable: a path, or a name resolved on PATH. The bare
+	// default "tdl" additionally falls back to tdl/tdl.exe in the working
+	// directory; see resolveBin.
 	Bin string
 	// Namespace is tdl's -n session namespace. Export and download must share
 	// it so the channel's peer cache is available to both.
@@ -27,6 +32,13 @@ type Runner struct {
 	// (a nil *os.File would be a non-nil interface wrapping a nil pointer, which
 	// exec would turn into an invalid child fd and silently drop tdl's output).
 	Stdout, Stderr io.Writer
+
+	// resolve* memoize the default-bin search: a Runner is reused across the
+	// batches of a download run, and resolution must not flip binaries mid-run.
+	// They stay zero for an explicit Bin, which needs no probing at all.
+	resolveOnce sync.Once
+	resolvedBin string
+	resolveErr  error
 }
 
 // ExportOptions configures "tdl chat export".
@@ -93,13 +105,67 @@ func (r *Runner) Login(ctx context.Context, code bool) error {
 	return r.run(ctx, []string{"login", "-T", mode})
 }
 
+// resolveBin maps a configured Bin to the executable to launch. Only the bare
+// default "tdl" is searched (PATH, then the working directory); any other value
+// from --tdl/TGXIV_TDL is used verbatim so odd setups (relative paths, renames)
+// keep working without filesystem probing.
+func resolveBin(bin string) (string, error) {
+	if bin != "tdl" {
+		return bin, nil
+	}
+	if p, ok := lookPathOK("tdl"); ok {
+		return p, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve tdl: %w", err)
+	}
+	// LookPath (not plain stat) so unix checks the exec bit and Windows PATHEXT
+	// finds tdl.exe via the "tdl" probe; the explicit tdl.exe probe covers
+	// PATHEXT oddities where LookPath would not append the extension.
+	if p, ok := lookPathOK(filepath.Join(cwd, "tdl")); ok {
+		return p, nil
+	}
+	if p, ok := lookPathOK(filepath.Join(cwd, "tdl.exe")); ok {
+		return p, nil
+	}
+	return "", fmt.Errorf("tdl executable not found: not in PATH and no tdl/tdl.exe in the working directory — put tdl in PATH, place tdl(.exe) in the working directory, or point --tdl/TGXIV_TDL at it")
+}
+
+// lookPathOK wraps exec.LookPath, treating ErrDot as a hit: Go flags
+// cwd-relative results (e.g. a "." PATH entry) with ErrDot, but the file was
+// found and is runnable. The returned path is always absolute.
+func lookPathOK(name string) (string, bool) {
+	p, err := exec.LookPath(name)
+	if err != nil && !errors.Is(err, exec.ErrDot) {
+		return "", false
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs, true
+	}
+	return "", false
+}
+
+// bin resolves the effective tdl executable for this runner, once per Runner.
+func (r *Runner) bin() (string, error) {
+	r.resolveOnce.Do(func() {
+		r.resolvedBin, r.resolveErr = resolveBin(r.Bin)
+	})
+	return r.resolvedBin, r.resolveErr
+}
+
 func (r *Runner) run(ctx context.Context, args []string) error {
+	bin, err := r.bin()
+	if err != nil {
+		return err
+	}
+
 	// namespace is a persistent flag, valid before the subcommand
 	full := append([]string{"-n", r.Namespace}, args...)
 
 	// CommandContext is required because we set a custom cmd.Cancel below; our
 	// Cancel replaces the default (which would SIGKILL) so tdl gets SIGINT.
-	cmd := exec.CommandContext(ctx, r.Bin, full...)
+	cmd := exec.CommandContext(ctx, bin, full...)
 
 	cmd.Stdout = os.Stdout
 	if r.Stdout != nil {
@@ -136,10 +202,14 @@ func (r *Runner) run(ctx context.Context, args []string) error {
 
 // Check verifies the configured binary is runnable by invoking "tdl version".
 func (r *Runner) Check(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, r.Bin, "version")
+	bin, err := r.bin()
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, bin, "version")
 	cmd.Stdout, cmd.Stderr = nil, nil
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("tdl binary %q not runnable: %w", r.Bin, err)
+		return fmt.Errorf("tdl binary %q not runnable: %w", bin, err)
 	}
 	return nil
 }

@@ -92,7 +92,8 @@ flowchart LR
 
 - **Go 1.26+** to build.
 - A **tdl binary** built from the [myl7 fork](https://github.com/myl7/tdl) (the
-  AGPL-3.0 engine), on `PATH` or pointed at with `--tdl`. Sanity-check the
+  AGPL-3.0 engine). An explicit `--tdl`/`TGXIV_TDL` wins; otherwise tgxiv looks
+  on `PATH`, then for `tdl`/`tdl.exe` in the working directory. Sanity-check the
   fork build with `tdl dl --help | grep keep-order`.
 - A **Telegram account** that can read the channel.
 

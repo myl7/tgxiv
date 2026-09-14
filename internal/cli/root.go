@@ -48,7 +48,7 @@ func NewRoot() *cobra.Command {
 	root.PersistentFlags().StringVarP(&flagDir, "dir", "d", "", "archive directory (env TGXIV_DIR)")
 	root.PersistentFlags().StringVarP(&flagNamespace, "ns", "n", "", "tdl session namespace (env TGXIV_NS, default \"default\")")
 	root.PersistentFlags().StringVarP(&flagChat, "chat", "c", "", "channel username, id, or link (env TGXIV_CHAT)")
-	root.PersistentFlags().StringVar(&flagTdl, "tdl", "", "tdl executable (env TGXIV_TDL, default \"tdl\")")
+	root.PersistentFlags().StringVar(&flagTdl, "tdl", "", "tdl executable (env TGXIV_TDL; default: PATH, then tdl/tdl.exe in the working directory)")
 
 	root.AddCommand(
 		newLoginCmd(),
