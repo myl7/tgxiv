@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Zoom from "react-medium-image-zoom";
 import "react-medium-image-zoom/dist/styles.css";
 import { ViewMessage, renderTextParts, Entity } from "@/lib/tdl";
@@ -47,6 +47,98 @@ function RawJsonModal({
     );
 }
 
+// The FileCard fetches zero media bytes until this modal opens: mounting it is
+// entering preview mode, and unmounting on close stops playback and frees the buffer.
+function MediaPreviewModal({
+    message,
+    onClose,
+}: {
+    message: ViewMessage;
+    onClose: () => void;
+}) {
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === "Escape") onClose();
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    }, [onClose]);
+
+    if (
+        message.previewKind !== "image" &&
+        message.previewKind !== "video" &&
+        message.previewKind !== "audio"
+    ) {
+        return null;
+    }
+
+    return (
+        <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+            onClick={onClose}
+        >
+            <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close preview"
+                className="absolute top-4 right-4 text-white/80 hover:text-white text-2xl leading-none px-1 cursor-pointer"
+            >
+                ✕
+            </button>
+            <div onClick={(e) => e.stopPropagation()}>
+                {message.previewKind === "image" && (
+                    <>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                            src={message.fileUrl}
+                            alt={message.originalFileName || "image"}
+                            className="max-w-[90vw] max-h-[90vh] object-contain rounded-lg"
+                        />
+                    </>
+                )}
+                {message.previewKind === "video" && (
+                    <video
+                        src={message.fileUrl}
+                        controls
+                        preload="metadata"
+                        className="max-w-[90vw] max-h-[90vh] rounded-lg"
+                    >
+                        Your browser does not support video playback.
+                    </video>
+                )}
+                {message.previewKind === "audio" && (
+                    <div className="bg-white rounded-xl shadow-2xl p-6 w-[min(90vw,28rem)] flex flex-col items-center gap-3">
+                        <svg
+                            className="w-10 h-10 text-[#3390ec]"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M9 9l10.5-3m0 6.553v3.75a2.25 2.25 0 01-1.632 2.163l-1.32.377a1.803 1.803 0 11-.99-3.467l2.31-.66a2.25 2.25 0 001.632-2.163zm0 0V2.25L9 5.25v10.303m0 0v3.75a2.25 2.25 0 01-1.632 2.163l-1.32.377a1.803 1.803 0 01-.99-3.467l2.31-.66A2.25 2.25 0 009 15.553z"
+                            />
+                        </svg>
+                        {message.originalFileName && (
+                            <p className="text-sm font-medium text-gray-700 text-center wrap-break-word">
+                                {message.originalFileName}
+                            </p>
+                        )}
+                        <audio
+                            src={message.fileUrl}
+                            controls
+                            preload="metadata"
+                            className="w-full"
+                        />
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
 function TextContent({ text, entities }: { text: string; entities?: Entity[] }) {
     const parts = renderTextParts(text, entities);
 
@@ -72,14 +164,12 @@ function TextContent({ text, entities }: { text: string; entities?: Entity[] }) 
 }
 
 function FileCard({ message }: { message: ViewMessage }) {
-    const [expanded, setExpanded] = useState(false);
+    const [previewOpen, setPreviewOpen] = useState(false);
     const previewable = message.previewKind !== "none";
 
     if (!message.fileUrl) return null;
 
-    const toggleLabel = expanded
-        ? "Hide preview"
-        : "Preview as " + message.previewKind;
+    const previewLabel = "Preview as " + message.previewKind;
 
     const squareClasses = "w-10 h-10 rounded-lg bg-[#3390ec] flex items-center justify-center shrink-0";
 
@@ -149,9 +239,9 @@ function FileCard({ message }: { message: ViewMessage }) {
                 {previewable ? (
                     <button
                         type="button"
-                        onClick={() => setExpanded((v) => !v)}
-                        aria-label={toggleLabel}
-                        title={toggleLabel}
+                        onClick={() => setPreviewOpen(true)}
+                        aria-label={previewLabel}
+                        title={previewLabel}
                         className={`${squareClasses} hover:bg-[#2b7cd3] cursor-pointer`}
                     >
                         {icon}
@@ -170,50 +260,11 @@ function FileCard({ message }: { message: ViewMessage }) {
                     <p className="text-xs text-gray-400">Download file</p>
                 </a>
             </div>
-            {expanded && previewable && (
-                <div className="mt-2">
-                    {message.previewKind === "image" && (
-                        <LazyMedia src={message.fileUrl} once className="block mt-1 min-h-24 rounded-lg bg-gray-100">
-                            {(src) => src ? (
-                                <Zoom>
-                                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                                    <img
-                                        src={src}
-                                        alt={message.originalFileName || "image"}
-                                        className="max-w-full max-h-100 rounded-lg object-contain cursor-zoom-in"
-                                        loading="lazy"
-                                    />
-                                </Zoom>
-                            ) : null}
-                        </LazyMedia>
-                    )}
-                    {message.previewKind === "video" && (
-                        <LazyMedia src={message.fileUrl} once={false} className="mt-1 min-h-24 rounded-lg bg-gray-100">
-                            {(src) => src ? (
-                                <video
-                                    src={src}
-                                    controls
-                                    preload="metadata"
-                                    className="max-w-full max-h-100 rounded-lg"
-                                >
-                                    Your browser does not support video playback.
-                                </video>
-                            ) : null}
-                        </LazyMedia>
-                    )}
-                    {message.previewKind === "audio" && (
-                        <LazyMedia src={message.fileUrl} once={false} className="mt-1 w-full min-h-10 rounded-lg bg-gray-100">
-                            {(src) => src ? (
-                                <audio
-                                    src={src}
-                                    controls
-                                    preload="metadata"
-                                    className="w-full h-8"
-                                />
-                            ) : null}
-                        </LazyMedia>
-                    )}
-                </div>
+            {previewOpen && previewable && (
+                <MediaPreviewModal
+                    message={message}
+                    onClose={() => setPreviewOpen(false)}
+                />
             )}
         </div>
     );
