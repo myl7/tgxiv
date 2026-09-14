@@ -1,10 +1,12 @@
-// Package migrate is the legacy-import module. Two entry points, both
+// Package migrate is the legacy-import module. Three entry points, all
 // deliberately offline (no tdl call): `migrate [FILE...]` backfills archive
 // content from tdl export JSON that predates the DB-stores-content design —
 // the stamped snapshots the old pipeline kept in export/, or any "tdl chat
-// export" file handed as an argument — and `migrate db` converts one old
+// export" file handed as an argument; `migrate db` converts one old
 // one-channel-per-directory archive (v2 archive.db plus flat media/ files)
-// into a dialog of a current archive root, run once per old directory.
+// into a dialog of a current archive root, run once per old directory; and
+// `migrate set-dialog` sets a dialog's metadata by hand, for channels deleted
+// on Telegram that the automatic refresh can never name.
 // Because the package only serves the transition, it can be deleted once
 // every old archive is converted, along with its single wiring line in
 // internal/cli/root.go and the README rows. Archive.Import stays in
