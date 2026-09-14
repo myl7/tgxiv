@@ -578,8 +578,8 @@ func TestOpenRejectsV2Layout(t *testing.T) {
 		_ = s.Close()
 		t.Fatal("Open on a v2 db: want an error, got nil")
 	}
-	if !strings.Contains(err.Error(), "tgxiv migrate db") {
-		t.Errorf("error %q does not mention the `tgxiv migrate db` remedy", err)
+	if !strings.Contains(err.Error(), "no longer supports") {
+		t.Errorf("error %q does not say the layout is unsupported", err)
 	}
 }
 

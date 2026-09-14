@@ -263,7 +263,7 @@ func TestRunMissingSource(t *testing.T) {
 }
 
 // TestRunSourceNotV3 pins the conversion hint: a source still carrying the v2
-// layout (messages, no dialogs) is refused with the `migrate db` remedy
+// layout (messages, no dialogs) is refused as not a v3 database
 // rather than mangled.
 func TestRunSourceNotV3(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
@@ -282,8 +282,8 @@ func TestRunSourceNotV3(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run against a v2 source: expected an error")
 	}
-	if !strings.Contains(err.Error(), "migrate db") {
-		t.Errorf("error must point at `tgxiv migrate db`, got: %v", err)
+	if !strings.Contains(err.Error(), "not a v3 archive database") {
+		t.Errorf("error must name the unsupported layout, got: %v", err)
 	}
 }
 

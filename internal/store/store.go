@@ -132,7 +132,7 @@ type Store struct {
 // Open opens (creating if needed) the archive DB at path and applies the v3
 // schema. A file that still carries the old one-dialog-per-db v2 layout
 // (a messages table but no dialogs table) is rejected: it must be converted
-// first with "tgxiv migrate db".
+// no longer; the v3 transition removed the converter.
 func Open(path string) (*Store, error) {
 	db, err := openDB(path)
 	if err != nil {
@@ -154,7 +154,7 @@ func Open(path string) (*Store, error) {
 		}
 		if !hasDialogs {
 			_ = db.Close()
-			return nil, fmt.Errorf("%s uses the old one-channel schema; run `tgxiv migrate db` to convert it first", path)
+			return nil, fmt.Errorf("%s uses the old one-channel schema that tgxiv no longer supports", path)
 		}
 	}
 

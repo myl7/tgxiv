@@ -31,7 +31,7 @@ import (
 // dbName and mediaDirName mirror internal/archive's layout constants — the
 // database file and media tree every archive root carries. Importing archive
 // for two literals would drag the tdl-running package into this offline one,
-// so they are mirrored instead (the migrate package mirrors them the same
+// so they are mirrored instead (deliberately not importing the tdl-running
 // way where it must avoid archive.Open's side effects).
 const (
 	dbName       = "tgxiv.sqlite"
@@ -145,7 +145,7 @@ func openSrcAttached(srcDB, dstDB string) (*sql.DB, error) {
 	err = db.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='dialogs'`).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		_ = db.Close()
-		return nil, fmt.Errorf("%s has no dialogs table; not a v3 archive database — bring legacy archives in with `tgxiv migrate db` first", srcDB)
+		return nil, fmt.Errorf("%s has no dialogs table; not a v3 archive database", srcDB)
 	}
 	if err != nil {
 		_ = db.Close()

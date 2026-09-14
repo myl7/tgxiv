@@ -377,8 +377,8 @@ func TestOpenRejectsLegacyLayout(t *testing.T) {
 	}
 
 	_, err := Open(Config{Dir: dir})
-	if err == nil || !strings.Contains(err.Error(), "one-channel-per-directory") || !strings.Contains(err.Error(), "migrate db") {
-		t.Fatalf("Open err = %v, want it naming the legacy layout and the migrate db remedy", err)
+	if err == nil || !strings.Contains(err.Error(), "one-channel-per-directory") || !strings.Contains(err.Error(), "no longer supports") {
+		t.Fatalf("Open err = %v, want it naming the legacy layout as unsupported", err)
 	}
 
 	// once the new DB exists the guard stands down, whatever else sits nearby

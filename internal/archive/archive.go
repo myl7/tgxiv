@@ -121,13 +121,13 @@ func Open(cfg Config) (*Archive, error) {
 	// loudly and point at the converter instead.
 	if _, err := os.Stat(cfg.dbPath()); os.IsNotExist(err) {
 		if _, err := os.Stat(filepath.Join(cfg.Dir, legacyDBName)); err == nil {
-			return nil, fmt.Errorf("%s uses the old one-channel-per-directory layout; run `tgxiv migrate db` to convert it into the new multi-dialog root", cfg.Dir)
+			return nil, fmt.Errorf("%s uses the old one-channel-per-directory layout that tgxiv no longer supports", cfg.Dir)
 		}
 	}
 
 	// Per-dialog folders under media/ and export/ appear on demand (MkdirAll
 	// in Export/runBatch); the roots themselves are created here. export/'s
-	// root included: JSON-era roots and migrate's replay of them expect it to
+	// root included: the transient export scratch space expects it to
 	// exist without a prior tgxiv write.
 	for _, d := range []string{cfg.Dir, cfg.mediaDir(), cfg.exportDir(), cfg.logsDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {

@@ -180,9 +180,6 @@ Legacy `TGCA_*` env vars are still honored as fallback.
 | `sync`               | incremental: export + download only messages newer than last time, per dialog |
 | `manifest`           | full export + import for the `--chat` dialog, no download                     |
 | `download` (`dl`)    | download the dialog's pending media, verify, retry                            |
-| `migrate [FILE...]`  | legacy: backfill content from JSON-era snapshots in export/, or import given tdl export JSON files; offline, no tdl call |
-| `migrate db <old-dir>` | convert an old one-channel v2 archive directory into a dialog of the root (see Migrating old archives) |
-| `migrate set-dialog <id>` | set/fix a dialog's title/username/kind by hand — the remedy for channels that no longer exist on Telegram (offline) |
 | `status`             | global summary plus a per-dialog block; `--chat` narrows to one dialog        |
 | `reset-failed`       | flip every `failed` task back to `pending` (all dialogs by default; `--chat` scopes to one) |
 | `split`              | move dialogs (rows, media, watermarks) out of this archive root into another via `--to` |
@@ -259,8 +256,7 @@ which channel a numeric folder belongs to.
 
 One root hosts any number of dialogs — channels, groups, and private chats
 alike — one row each in `dialogs`, one subdirectory each under `media/`. The
-`--dir, -d` flag (env `TGXIV_DIR`) points at this root for every command. Old
-archives are brought into it with `migrate` / `migrate db` (below).
+`--dir, -d` flag (env `TGXIV_DIR`) points at this root for every command.
 
 ## Splitting an archive root
 
@@ -273,45 +269,6 @@ the same command. Media folders move first, then a single cross-database
 transaction copies the rows into the destination and deletes them from the
 source — which makes an interrupted run resumable by re-running the same
 command: already-moved dialogs are recognized and skipped.
-
-## Migrating old archives
-
-All paths are offline — no tdl call.
-
-- `tgxiv migrate [FILE...]` — unchanged: backfills content from JSON-era export
-  snapshots under `export/`, or from tdl export JSON files you pass it, into
-  the root's database (files untouched).
-- `tgxiv migrate db <old-channel-dir> [--chat-id N] [--username u] [--title t]
-  [--kind channel|group|private] [--force]` — converts one old v2 one-channel
-  archive directory (its own `archive.db` and flat
-  `media/<chatID>_<msgID>_<name>` files) into a dialog of the root. Run it
-  once per old directory, with the shared `-d` pointing at the root:
-
-  - media is moved into `media/<dialog_id>/` (a rename when possible, with a
-    copy-and-verify fallback) and task progress is preserved;
-  - `--chat-id` is optional: it is auto-derived from the archive (the
-    downloads manifest, falling back to the recorded channel id) and only
-    needs passing when the archive itself is ambiguous;
-  - a task whose file is found present at the right size — in the old
-    `media/` or already at its new location — is marked `done` whatever its
-    old status said, so no post-migration `download` pass is needed just to
-    reconcile states;
-  - `done` tasks whose files went missing are downgraded to `pending`, so the
-    next `download` self-heals them;
-  - orphan manifest entries get placeholder content rows;
-  - it refuses if the old downloads belong to a different chat id;
-  - an interrupted run can be re-run with `--force`;
-  - the old directory is kept — its `archive.db` is the backup.
-
-  v1-era databases must first be upgraded by the previous tgxiv release.
-- `tgxiv migrate set-dialog <dialog_id> [--title t] [--username u]
-  [--kind channel|group|private]` — set or fix one dialog's title, username,
-  or kind by hand, directly in the root's database. The automatic metadata
-  refresh needs the dialog to still exist on Telegram, so a channel deleted
-  there can never be named that way; this is the remedy. In particular,
-  `migrate db`'s `--title`/`--username`/`--kind` can also be set or fixed
-  AFTER the conversion, so old directories can be deleted without losing the
-  chance to name dead channels.
 
 ## Web viewer
 
