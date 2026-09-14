@@ -17,13 +17,13 @@ type verifyResult struct {
 	path       string // located file path, empty if none
 }
 
-// verify looks for the finished download of message msgID in dir. tdl's default
-// template names files "<dialogID>_<msgID>_<name>", so the prefix locates the
-// file regardless of how the name was sanitized or whether the extension was
-// rewritten. In-progress ".tmp" files are ignored. The trailing underscore in
-// the prefix prevents msg 1 from matching msg 10.
-func verify(dir string, dialogID int64, msgID int, expectedSize int64) (verifyResult, error) {
-	prefix := formatPrefix(dialogID, msgID)
+// verify looks for the finished download of message msgID in the dialog's
+// media dir. tdl names files "<msgID>_<name>" there (dlTemplate), so the
+// prefix locates the file regardless of how the name was sanitized or whether
+// the extension was rewritten. In-progress ".tmp" files are ignored. The
+// trailing underscore in the prefix prevents msg 1 from matching msg 10.
+func verify(dir string, msgID int, expectedSize int64) (verifyResult, error) {
+	prefix := formatPrefix(msgID)
 	matches, err := filepath.Glob(filepath.Join(dir, prefix+"*"))
 	if err != nil {
 		return verifyResult{}, err
@@ -52,7 +52,7 @@ func verify(dir string, dialogID int64, msgID int, expectedSize int64) (verifyRe
 	return res, nil
 }
 
-// formatPrefix builds the literal "<dialogID>_<msgID>_" filename prefix.
-func formatPrefix(dialogID int64, msgID int) string {
-	return strconv.FormatInt(dialogID, 10) + "_" + strconv.Itoa(msgID) + "_"
+// formatPrefix builds the literal "<msgID>_" filename prefix.
+func formatPrefix(msgID int) string {
+	return strconv.Itoa(msgID) + "_"
 }

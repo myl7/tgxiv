@@ -10,34 +10,36 @@ import (
 	"github.com/myl7/tgxiv/internal/archive"
 )
 
-// writeFailedReport writes the current list of permanently failed messages of
-// the dialog the archive last operated on to a timestamped file under the
-// archive's logs dir. It is a no-op when nothing has failed.
-func writeFailedReport(a *archive.Archive) error {
-	dialogID := a.DialogID()
-	if dialogID == 0 {
-		return nil // no Import or Download ran; there is no dialog to report on
-	}
-	failed, err := a.Store().ListFailed(dialogID)
-	if err != nil {
-		return err
-	}
-	if len(failed) == 0 {
-		return nil
-	}
+// writeFailedReports writes one timestamped failed-list file per dialog to
+// logs/failed-<dialog_id>-<ts>.txt. dialogIDs is the set of dialogs a run
+// actually touched: the single dialog of a normal download, or every dialog a
+// --retry run's refs named. A dialog with nothing failed gets no file.
+func writeFailedReports(a *archive.Archive, dialogIDs []int64) error {
+	for _, dialogID := range dialogIDs {
+		if dialogID == 0 {
+			continue // no Import or Download ran; there is no dialog to report on
+		}
+		failed, err := a.Store().ListFailed(dialogID)
+		if err != nil {
+			return err
+		}
+		if len(failed) == 0 {
+			continue
+		}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "# %d failed messages\n", len(failed))
-	fmt.Fprintf(&b, "# msg_id\tsize\tmedia_type\tfile\n")
-	for _, r := range failed {
-		fmt.Fprintf(&b, "%d\t%d\t%s\t%s\n", r.MsgID, r.Size, r.MediaType, r.FileName)
-	}
+		var b strings.Builder
+		fmt.Fprintf(&b, "# dialog %d: %d failed messages\n", dialogID, len(failed))
+		fmt.Fprintf(&b, "# msg_id\tsize\tmedia_type\tfile\n")
+		for _, r := range failed {
+			fmt.Fprintf(&b, "%d\t%d\t%s\t%s\n", r.MsgID, r.Size, r.MediaType, r.FileName)
+		}
 
-	name := filepath.Join(a.LogsDir(), "failed-"+timestamp()+".txt")
-	if err := os.WriteFile(name, []byte(b.String()), 0o644); err != nil {
-		return err
+		name := filepath.Join(a.LogsDir(), fmt.Sprintf("failed-%d-%s.txt", dialogID, timestamp()))
+		if err := os.WriteFile(name, []byte(b.String()), 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("[archive] dialog %d: %d failed messages; report written to %s\n", dialogID, len(failed), name)
 	}
-	fmt.Printf("[archive] %d failed messages; report written to %s\n", len(failed), name)
 	return nil
 }
 
