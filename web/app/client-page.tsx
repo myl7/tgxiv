@@ -264,6 +264,11 @@ export function ClientPage({ channels }: ClientPageProps) {
     const loadMore = useCallback(() => {
         if (isLoadingRef.current || !hasMore) return;
 
+        // No pagination before the first page lands: without a cached page the
+        // oldestId cursor is null, which would re-fetch the newest page and duplicate it.
+        const existing = channelCaches.get(selectedChannelId);
+        if (isChannelLoading || !existing || existing.messages.length === 0) return;
+
         const container = scrollContainerRef.current;
         if (container) {
             prevScrollHeightRef.current = container.scrollHeight;
@@ -275,10 +280,11 @@ export function ClientPage({ channels }: ClientPageProps) {
             setLoadedCount((prev) => Math.min(prev + BATCH_SIZE, totalCount));
         } else if (serverHasMore) {
             // Fetch next chunk from API
-            isLoadingRef.current = true;
             const meta = channels.find((c) => c.channelId === selectedChannelId);
-            if (!meta) return;
-            const currentOldestId = channelCaches.get(selectedChannelId)?.oldestId ?? null;
+            const currentOldestId = existing.oldestId;
+            if (!meta || currentOldestId == null) return;
+
+            isLoadingRef.current = true;
 
             fetchMessages(meta.dirName, currentOldestId).then((result) => {
                 const processed = processMessages(
@@ -286,10 +292,13 @@ export function ClientPage({ channels }: ClientPageProps) {
                     meta.dirName,
                 );
 
+                const existingIds = new Set(existing.messages.map((m) => m.msgId));
+                const fresh = processed.filter((m) => !existingIds.has(m.msgId));
+
                 setChannelCaches((prev) => {
-                    const existing = prev.get(selectedChannelId);
-                    if (!existing) return prev;
-                    const merged = [...processed, ...existing.messages];
+                    const current = prev.get(selectedChannelId);
+                    if (!current) return prev;
+                    const merged = [...fresh, ...current.messages];
                     const next = new Map(prev);
                     next.set(selectedChannelId, {
                         messages: merged,
@@ -301,13 +310,14 @@ export function ClientPage({ channels }: ClientPageProps) {
                 });
 
                 // Increase loadedCount by the number of new messages
-                setLoadedCount((prev) => prev + processed.length);
+                setLoadedCount((prev) => prev + fresh.length);
+                isLoadingRef.current = false;
             }).catch((err) => {
                 console.error("Failed to load more messages:", err);
                 isLoadingRef.current = false;
             });
         }
-    }, [hasMore, hasMoreLocal, serverHasMore, totalCount, channels, selectedChannelId, channelCaches]);
+    }, [hasMore, hasMoreLocal, serverHasMore, isChannelLoading, totalCount, channels, selectedChannelId, channelCaches]);
 
     useEffect(() => {
         loadMoreRef.current = loadMore;
