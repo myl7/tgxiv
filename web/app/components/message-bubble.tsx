@@ -1,8 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Zoom from "react-medium-image-zoom";
-import "react-medium-image-zoom/dist/styles.css";
 import { ViewMessage, renderTextParts, Entity } from "@/lib/tdl";
 import { LazyMedia } from "./lazy-media";
 
@@ -270,26 +268,54 @@ function FileCard({ message }: { message: ViewMessage }) {
     );
 }
 
+// Extracted so the image case can hold the preview-open state; MediaContent
+// has an early return before any hook, so it cannot own hooks itself.
+function InlineImage({ message }: { message: ViewMessage }) {
+    const [previewOpen, setPreviewOpen] = useState(false);
+    const expandLabel = message.originalFileName
+        ? `Expand image: ${message.originalFileName}`
+        : "Expand image";
+
+    if (!message.fileUrl) return null;
+
+    return (
+        <LazyMedia src={message.fileUrl} once className="block mt-1 min-h-24 rounded-lg bg-gray-100">
+            {(src) => src ? (
+                <>
+                    {/* Button resets: a button re-applies UA styling, so strip border/background/padding. */}
+                    <button
+                        type="button"
+                        onClick={() => setPreviewOpen(true)}
+                        aria-label={expandLabel}
+                        title={expandLabel}
+                        className="block border-0 bg-transparent p-0 cursor-zoom-in"
+                    >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                            src={src}
+                            alt={message.originalFileName || "image"}
+                            className="max-w-full max-h-100 rounded-lg object-contain cursor-zoom-in"
+                            loading="lazy"
+                        />
+                    </button>
+                    {previewOpen && (
+                        <MediaPreviewModal
+                            message={message}
+                            onClose={() => setPreviewOpen(false)}
+                        />
+                    )}
+                </>
+            ) : null}
+        </LazyMedia>
+    );
+}
+
 function MediaContent({ message }: { message: ViewMessage }) {
     if (!message.fileUrl || message.mediaKind === "none") return null;
 
     switch (message.mediaKind) {
         case "image":
-            return (
-                <LazyMedia src={message.fileUrl} once className="block mt-1 min-h-24 rounded-lg bg-gray-100">
-                    {(src) => src ? (
-                        <Zoom>
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                                src={src}
-                                alt={message.originalFileName || "image"}
-                                className="max-w-full max-h-100 rounded-lg object-contain cursor-zoom-in"
-                                loading="lazy"
-                            />
-                        </Zoom>
-                    ) : null}
-                </LazyMedia>
-            );
+            return <InlineImage message={message} />;
         case "video":
             return (
                 <LazyMedia src={message.fileUrl} once={false} className="mt-1 min-h-24 rounded-lg bg-gray-100">
