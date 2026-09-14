@@ -85,7 +85,9 @@ flowchart LR
    batches, and runs `tdl dl` with `--keep-order --skip-same --continue` on
    each. After every batch it verifies each file by size, marking it `done` or
    spending one retry attempt. Files land in `media/` named
-   `<channelID>_<msgID>_<name>`.
+   `<channelID>_<msgID>_<name>`. A batch that writes no bytes for
+   `--idle-timeout` (default `5m`, `TGXIV_IDLE_TIMEOUT`, `0s` disables) is
+   killed, and repeated stalls count toward the failed threshold.
 4. **report** lists anything that exhausted its attempts under `logs/`.
 
 ## Requirements

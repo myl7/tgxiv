@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -18,16 +19,20 @@ import (
 	"github.com/myl7/tgxiv/internal/tdlx"
 )
 
+// ErrIdleTimeout marks a tdl batch killed by the idle watchdog (runBatch).
+var ErrIdleTimeout = errors.New("tdl idle timeout")
+
 // Config is the archive's static configuration.
 type Config struct {
-	Dir         string // archive root directory
-	Chat        string // channel username, id, or link (for export)
-	Namespace   string // tdl session namespace
-	TdlBin      string // tdl executable
-	BatchSize   int    // messages per tdl dl invocation
-	MaxAttempts int    // per-message download attempts before giving up
-	Threads     int    // tdl --threads (0 = tdl default)
-	Limit       int    // tdl --limit concurrent files (0 = tdl default)
+	Dir         string        // archive root directory
+	Chat        string        // channel username, id, or link (for export)
+	Namespace   string        // tdl session namespace
+	TdlBin      string        // tdl executable
+	BatchSize   int           // messages per tdl dl invocation
+	MaxAttempts int           // per-message download attempts before giving up
+	Threads     int           // tdl --threads (0 = tdl default)
+	Limit       int           // tdl --limit concurrent files (0 = tdl default)
+	IdleTimeout time.Duration // kill a batch whose media dir stopped growing for this long (0 = off)
 }
 
 // tdlRunner is the slice of tdlx.Runner the archive depends on. It is an
@@ -43,6 +48,9 @@ type Archive struct {
 	cfg    Config
 	store  *store.Store
 	runner tdlRunner
+	// idleSample is the idle watchdog's dir-size sampling interval, derived
+	// from IdleTimeout in Open; tests shrink it to keep runs fast.
+	idleSample time.Duration
 }
 
 // Layout returns the standard sub-paths under the archive dir.
@@ -77,14 +85,26 @@ func Open(cfg Config) (*Archive, error) {
 		return nil, err
 	}
 
-	return &Archive{
+	a := &Archive{
 		cfg:   cfg,
 		store: st,
 		runner: &tdlx.Runner{
 			Bin:       cfg.TdlBin,
 			Namespace: cfg.Namespace,
 		},
-	}, nil
+	}
+	if cfg.IdleTimeout > 0 {
+		// sample at a quarter of the timeout, bounded so tiny timeouts stay
+		// cheap to walk and huge ones still react within 30s
+		a.idleSample = cfg.IdleTimeout / 4
+		if a.idleSample < 50*time.Millisecond {
+			a.idleSample = 50 * time.Millisecond
+		}
+		if a.idleSample > 30*time.Second {
+			a.idleSample = 30 * time.Second
+		}
+	}
+	return a, nil
 }
 
 // Close releases the state DB.
@@ -261,6 +281,7 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 
 		doneThisPass := 0
 		infraError := false
+		var lastBatchErr error
 
 		for _, batch := range chunk(pending, a.cfg.BatchSize) {
 			if err := ctx.Err(); err != nil {
@@ -273,7 +294,12 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 			}
 			if cmdErr != nil {
 				infraError = true
-				fmt.Printf("[archive] tdl batch error (will not count as a file attempt): %v\n", cmdErr)
+				lastBatchErr = cmdErr
+				note := "will not count as a file attempt"
+				if errors.Is(cmdErr, ErrIdleTimeout) {
+					note = "counts as a file attempt"
+				}
+				fmt.Printf("[archive] tdl batch error (%s): %v\n", note, cmdErr)
 			}
 
 			for _, r := range batch {
@@ -288,6 +314,12 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 					}
 					res.Done++
 					doneThisPass++
+				case cmdErr != nil && errors.Is(cmdErr, ErrIdleTimeout):
+					// the stall burned the batch's wall clock; charge it so a
+					// permanently stuck item fails instead of stalling reruns
+					if err := a.store.MarkAttempt(r.MsgID, vr.actualSize, "tdl idle timeout", a.cfg.MaxAttempts); err != nil {
+						return res, err
+					}
 				case cmdErr != nil:
 					// infra failure: leave pending, do not burn an attempt
 				default:
@@ -303,7 +335,7 @@ func (a *Archive) Download(ctx context.Context) (DownloadResult, error) {
 		// termination guard: if a pass made zero progress purely because tdl
 		// failed, stop instead of looping forever on an infra problem.
 		if doneThisPass == 0 && infraError {
-			return res, fmt.Errorf("tdl failed and no files were downloaded this pass; fix the cause and rerun")
+			return res, fmt.Errorf("tdl failed and no files were downloaded this pass (%w); fix the cause and rerun", lastBatchErr)
 		}
 	}
 
@@ -322,7 +354,7 @@ func (a *Archive) runBatch(ctx context.Context, channelID int64, batch []store.R
 	}
 	defer func() { _ = os.Remove(batchFile) }()
 
-	return a.runner.Download(ctx, tdlx.DownloadOptions{
+	opts := tdlx.DownloadOptions{
 		BatchFile: batchFile,
 		Dir:       a.cfg.mediaDir(),
 		Threads:   a.cfg.Threads,
@@ -330,7 +362,91 @@ func (a *Archive) runBatch(ctx context.Context, channelID int64, batch []store.R
 		// batches are written smallest-first; keep-order makes tdl honor that
 		// instead of re-sorting by message id, giving strict size ordering.
 		KeepOrder: true,
+	}
+
+	if a.cfg.IdleTimeout <= 0 {
+		return a.runner.Download(ctx, opts)
+	}
+
+	// Idle watchdog: tdl can hang forever on one media item (0-byte .tmp,
+	// idle TCP). Kill the batch once the media dir stops growing for
+	// IdleTimeout, so the batch's finished files still get verified and
+	// committed instead of waiting on the stuck one.
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var idleErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mediaDir := a.cfg.mediaDir()
+		lastGrow := time.Now()
+		lastBytes, err := dirBytes(mediaDir)
+		if err != nil {
+			lastBytes = 0
+		}
+		ticker := time.NewTicker(a.idleSample)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-ticker.C:
+			}
+			// parent cancel is the user stopping the run, never an idle kill
+			if ctx.Err() != nil {
+				return
+			}
+			cur, err := dirBytes(mediaDir)
+			if err != nil {
+				continue // our own I/O hiccup must not kill a live tdl
+			}
+			if cur > lastBytes {
+				lastBytes, lastGrow = cur, time.Now()
+				continue
+			}
+			if time.Since(lastGrow) >= a.cfg.IdleTimeout {
+				idleErr = fmt.Errorf("tdl batch idle for %s (no media bytes written): %w", a.cfg.IdleTimeout, ErrIdleTimeout)
+				cancel()
+				return
+			}
+		}
+	}()
+
+	err := a.runner.Download(wctx, opts)
+	cancel() // runner is done: stop the watchdog...
+	<-done   // ...and join it before returning, so batches leak no goroutines
+	// the watchdog can fire just after tdl finished everything; a successful
+	// run wins over the late idle flag
+	if err != nil && idleErr != nil {
+		return idleErr // replaces the runner's bare context.Canceled
+	}
+	return err
+}
+
+// dirBytes sums the sizes of all regular files under dir, ".tmp" in-progress
+// files included: while tdl is writing, the total keeps growing, so a stall is
+// detectable without knowing which file tdl is on. A missing dir reads as 0.
+func dirBytes(dir string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		return nil
 	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	return total, err
 }
 
 func (a *Archive) channelID() (int64, error) {

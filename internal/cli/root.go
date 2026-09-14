@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -20,6 +21,7 @@ var (
 	flagNamespace string
 	flagChat      string
 	flagTdl       string
+	flagIdle      string
 )
 
 // envOr returns the flag value if non-empty, else the first non-empty env var
@@ -49,6 +51,7 @@ func NewRoot() *cobra.Command {
 	root.PersistentFlags().StringVarP(&flagNamespace, "ns", "n", "", "tdl session namespace (env TGXIV_NS, default \"default\")")
 	root.PersistentFlags().StringVarP(&flagChat, "chat", "c", "", "channel username, id, or link (env TGXIV_CHAT)")
 	root.PersistentFlags().StringVar(&flagTdl, "tdl", "", "tdl executable (env TGXIV_TDL; default: PATH, then tdl/tdl.exe in the working directory)")
+	root.PersistentFlags().StringVar(&flagIdle, "idle-timeout", "", "kill a stalled tdl dl batch after this long with no bytes written (default 5m; env TGXIV_IDLE_TIMEOUT; 0s disables)")
 
 	root.AddCommand(
 		newLoginCmd(),
@@ -70,11 +73,17 @@ func baseConfig() (archive.Config, error) {
 	if dir == "" {
 		return archive.Config{}, fmt.Errorf("archive directory is required (--dir or TGXIV_DIR)")
 	}
+	idleRaw := envOr(flagIdle, []string{"TGXIV_IDLE_TIMEOUT"}, "5m")
+	idle, err := time.ParseDuration(idleRaw)
+	if err != nil {
+		return archive.Config{}, fmt.Errorf("invalid idle timeout %q (--idle-timeout or TGXIV_IDLE_TIMEOUT must be a duration like 5m or 0s): %w", idleRaw, err)
+	}
 	return archive.Config{
-		Dir:       dir,
-		Chat:      envOr(flagChat, []string{"TGXIV_CHAT", "TGCA_CHAT"}, ""),
-		Namespace: envOr(flagNamespace, []string{"TGXIV_NS", "TGCA_NS"}, "default"),
-		TdlBin:    envOr(flagTdl, []string{"TGXIV_TDL"}, "tdl"),
+		Dir:         dir,
+		Chat:        envOr(flagChat, []string{"TGXIV_CHAT", "TGCA_CHAT"}, ""),
+		Namespace:   envOr(flagNamespace, []string{"TGXIV_NS", "TGCA_NS"}, "default"),
+		TdlBin:      envOr(flagTdl, []string{"TGXIV_TDL"}, "tdl"),
+		IdleTimeout: idle,
 	}, nil
 }
 

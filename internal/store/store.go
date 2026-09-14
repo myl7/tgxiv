@@ -10,6 +10,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -471,6 +472,19 @@ UPDATE downloads SET
     updated_at = ?
 WHERE msg_id = ?`, actualSize, errMsg, maxAttempts, time.Now().Unix(), msgID)
 	return err
+}
+
+// Attempts returns the attempt count recorded for msgID; ok is false when the
+// message has no download row.
+func (s *Store) Attempts(msgID int) (n int, ok bool, err error) {
+	err = s.db.QueryRow(`SELECT attempts FROM downloads WHERE msg_id = ?`, msgID).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return n, true, nil
 }
 
 // Counts returns the number of download rows per status

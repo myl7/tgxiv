@@ -3,10 +3,12 @@ package archive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/myl7/tgxiv/internal/store"
 	"github.com/myl7/tgxiv/internal/tdlx"
@@ -19,6 +21,7 @@ type fakeRunner struct {
 	writeSize map[int]int
 	calls     int
 	failNext  bool // one-shot: next Download returns an infra error and writes nothing
+	waitKill  bool // after writing, park until ctx is done, then still report success
 
 	// export simulation
 	exportJSON     string             // written to opts.Output on Export, if set
@@ -35,7 +38,7 @@ func (f *fakeRunner) Export(_ context.Context, o tdlx.ExportOptions) error {
 	return nil
 }
 
-func (f *fakeRunner) Download(_ context.Context, o tdlx.DownloadOptions) error {
+func (f *fakeRunner) Download(ctx context.Context, o tdlx.DownloadOptions) error {
 	f.calls++
 	if f.failNext {
 		f.failNext = false
@@ -59,10 +62,16 @@ func (f *fakeRunner) Download(_ context.Context, o tdlx.DownloadOptions) error {
 			return err
 		}
 	}
+	if f.waitKill {
+		// every file is on disk; park until the watchdog kills the batch and
+		// report success anyway, to hit the fired-idle-but-tdl-won race
+		<-ctx.Done()
+		return nil
+	}
 	return nil
 }
 
-func setup(t *testing.T, cfg Config, fake *fakeRunner, recs []store.Record) *Archive {
+func setup(t *testing.T, cfg Config, runner tdlRunner, recs []store.Record) *Archive {
 	t.Helper()
 	cfg.Dir = t.TempDir()
 	a, err := Open(cfg)
@@ -70,7 +79,7 @@ func setup(t *testing.T, cfg Config, fake *fakeRunner, recs []store.Record) *Arc
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.Close() })
-	a.runner = fake
+	a.runner = runner
 
 	if err := a.store.SetMeta("channel_id", "100"); err != nil {
 		t.Fatal(err)
@@ -163,6 +172,146 @@ func TestDownloadCanceledStops(t *testing.T) {
 	}
 	if fake.calls != 0 {
 		t.Errorf("calls = %d, want 0 (should not invoke tdl when already canceled)", fake.calls)
+	}
+}
+
+// blockingRunner stands in for a hung tdl: Download blocks until its context
+// is done, first appending to a .tmp file every 50ms for growFor to simulate
+// a live transfer that then goes idle.
+type blockingRunner struct {
+	growFor time.Duration
+}
+
+func (b *blockingRunner) Check(context.Context) error { return nil }
+
+func (b *blockingRunner) Export(context.Context, tdlx.ExportOptions) error { return nil }
+
+func (b *blockingRunner) Download(ctx context.Context, o tdlx.DownloadOptions) error {
+	if b.growFor > 0 {
+		part := filepath.Join(o.Dir, "100_1_live.bin.tmp")
+		deadline := time.Now().Add(b.growFor)
+		for time.Now().Before(deadline) {
+			f, err := os.OpenFile(part, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				return err
+			}
+			_, _ = f.Write(make([]byte, 2048))
+			_ = f.Close()
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestDownloadIdleTimeoutBurnsAttempt(t *testing.T) {
+	a := setup(t,
+		Config{BatchSize: 10, MaxAttempts: 3, IdleTimeout: 200 * time.Millisecond},
+		&blockingRunner{}, recsWithSizeEqualsID(1))
+	a.idleSample = 50 * time.Millisecond
+
+	_, err := a.Download(context.Background())
+	if err == nil || !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("err = %v, want an error wrapping ErrIdleTimeout", err)
+	}
+	// the stalled message burns one attempt but stays pending
+	pending, _ := a.store.ListPending()
+	if len(pending) != 1 {
+		t.Fatalf("pending = %d, want 1", len(pending))
+	}
+	if n, ok, _ := a.store.Attempts(1); !ok || n != 1 {
+		t.Errorf("attempts = %d (ok %v), want 1", n, ok)
+	}
+}
+
+func TestIdleWatchdogGrowthPreventsKill(t *testing.T) {
+	a := setup(t,
+		Config{BatchSize: 10, MaxAttempts: 3, IdleTimeout: 300 * time.Millisecond},
+		&blockingRunner{growFor: 400 * time.Millisecond}, recsWithSizeEqualsID(1))
+	a.idleSample = 50 * time.Millisecond
+
+	start := time.Now()
+	_, err := a.Download(context.Background())
+	elapsed := time.Since(start)
+	if err == nil || !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("err = %v, want an error wrapping ErrIdleTimeout", err)
+	}
+	// growth keeps resetting the idle clock, so the kill must postdate the
+	// 400ms of live transfer plus the 300ms idle window, not just 300ms
+	if elapsed < 400*time.Millisecond {
+		t.Errorf("killed after %s, want >= the 400ms of live transfer", elapsed)
+	}
+}
+
+func TestIdleWatchdogUserCancelNotIdle(t *testing.T) {
+	a := setup(t,
+		Config{BatchSize: 10, MaxAttempts: 3, IdleTimeout: 1 * time.Second},
+		&blockingRunner{}, recsWithSizeEqualsID(1))
+	a.idleSample = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := a.Download(ctx)
+		errc <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrIdleTimeout) {
+			t.Fatalf("err = %v, want context.Canceled and not an idle kill", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Download did not return after cancel")
+	}
+	// a user stop must not burn an attempt
+	if n, ok, _ := a.store.Attempts(1); !ok || n != 0 {
+		t.Errorf("attempts = %d (ok %v), want 0", n, ok)
+	}
+}
+
+func TestRunBatchIdleFiresAfterRunnerSuccess(t *testing.T) {
+	// waitKill makes the runner write every file, get killed by the watchdog,
+	// and still report success: the idle flag is set, but the batch won
+	fake := &fakeRunner{writeSize: map[int]int{1: 1}, waitKill: true}
+	a := setup(t,
+		Config{BatchSize: 10, MaxAttempts: 3, IdleTimeout: 100 * time.Millisecond},
+		fake, recsWithSizeEqualsID(1))
+	a.idleSample = 20 * time.Millisecond
+
+	if err := a.runBatch(context.Background(), 100, recsWithSizeEqualsID(1)); err != nil {
+		t.Fatalf("runBatch err = %v, want nil (success beats the late idle kill)", err)
+	}
+}
+
+func TestDirBytes(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel string, n int) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, rel), make([]byte, n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("100_1_a.jpg", 10)
+	write("100_2_b.jpg.tmp", 20) // in-progress files count toward growth
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(filepath.Join("sub", "c.bin"), 5)
+
+	got, err := dirBytes(dir)
+	if err != nil || got != 35 {
+		t.Errorf("dirBytes = %d, err %v; want 35, nil", got, err)
+	}
+	got, err = dirBytes(filepath.Join(dir, "missing"))
+	if err != nil || got != 0 {
+		t.Errorf("dirBytes(missing) = %d, err %v; want 0, nil", got, err)
 	}
 }
 
