@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/myl7/tgxiv/internal/archive"
+	"github.com/myl7/tgxiv/internal/migrate"
 )
 
 // shared flags, resolved in PersistentPreRun with env fallbacks
@@ -51,14 +52,13 @@ func NewRoot() *cobra.Command {
 
 	root.AddCommand(
 		newLoginCmd(),
-		newExportCmd(),
-		newDownloadCmd(),
+		newArchiveCmd(),
 		newSyncCmd(),
-		newUpdateCmd(),
+		newManifestCmd(),
+		newDownloadCmd(),
 		newStatusCmd(),
-		newImportCmd(),
-		newMigrateCmd(),
 		newResetFailedCmd(),
+		migrate.New(baseConfig),
 	)
 	return root
 }

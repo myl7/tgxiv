@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"time"
 
 	"github.com/myl7/tgxiv/internal/exportjson"
@@ -223,47 +221,6 @@ func (a *Archive) Import(path string) (added int, err error) {
 
 // channelIDPlaceholder is overwritten before insert; kept explicit for clarity.
 const channelIDPlaceholder int64 = 0
-
-// stampExportRe matches the file names of the stamped export snapshots the
-// JSON-era pipeline kept in export/ (tdl's 20060102-150405 naming). Anything
-// else in that dir (batch.json, stray files) is transient and skipped.
-var stampExportRe = regexp.MustCompile(`^\d{8}-\d{6}\.json$`)
-
-// ReplayExports backfills the messages content table of an old archive from the
-// stamped export JSON snapshots still kept in <dir>/export/. The files are
-// replayed oldest first (for the stamp naming, lexical order is chronological
-// order), so the newest snapshot of a message wins — the same merge rule the
-// old viewer used. Each snapshot goes through Import: content rows are fully
-// rewritten, the manifest is refreshed without touching download progress, the
-// watermark advances monotonically, and the snapshot files themselves are never
-// deleted. The whole operation is offline (no tdl call). A missing directory or
-// no matching snapshots is not an error; the caller decides the message.
-func (a *Archive) ReplayExports() (files int, err error) {
-	entries, err := os.ReadDir(a.cfg.exportDir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, err
-	}
-
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() || !stampExportRe.MatchString(e.Name()) {
-			continue
-		}
-		names = append(names, e.Name())
-	}
-	sort.Strings(names) // oldest first; os.ReadDir already sorts, this pins it
-
-	for _, name := range names {
-		if _, err := a.Import(filepath.Join(a.cfg.exportDir(), name)); err != nil {
-			return files, fmt.Errorf("replay %s: %w", name, err)
-		}
-		files++
-	}
-	return files, nil
-}
 
 // DownloadResult summarizes a download run.
 type DownloadResult struct {

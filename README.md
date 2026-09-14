@@ -15,7 +15,7 @@ services to run.
 Point it at a channel. It exports the message manifest, then pulls every photo
 and file in strict **smallest-to-largest** order, checks each one against its
 expected byte size, retries what fails, and resumes exactly where it stopped.
-Run `update` later and it fetches only what is new.
+Run `sync` later and it fetches only what is new.
 
 </div>
 
@@ -53,7 +53,7 @@ consequences of that engine shaped the design:
 - ⏸️ **Stop anytime, resume clean.** Ctrl-C interrupts tdl (SIGINT) for a
   graceful stop. The next run skips finished files and never leaves a truncated
   file marked done.
-- ⏩ **Incremental sync.** `update` fetches only messages newer than your last
+- ⏩ **Incremental sync.** `sync` fetches only messages newer than your last
   run, tracked by a watermark in the state DB.
 - 🧾 **The text stays too.** Every message's content — text-only and service
   messages included — is stored in `archive.db`, which is the channel's text
@@ -115,10 +115,10 @@ tgxiv login
 
 ```sh
 # first archive: full export, then download smallest-first
-tgxiv -d ~/archives/mychannel -c mychannel sync
+tgxiv -d ~/archives/mychannel -c mychannel archive
 
 # later: pull only what is new
-tgxiv -d ~/archives/mychannel update
+tgxiv -d ~/archives/mychannel sync
 
 # check progress and any failures
 tgxiv -d ~/archives/mychannel status
@@ -143,16 +143,15 @@ Legacy `TGCA_*` env vars are still honored as fallback.
 | command        | what it does                                                          |
 |----------------|-----------------------------------------------------------------------|
 | `login`        | log in to Telegram via `tdl login` (QR by default; `--code` for phone+code) |
-| `sync`         | full export + download (use for the first run and periodic reconcile) |
-| `update`       | incremental: export + download only messages newer than last time     |
-| `export`       | full export + import manifest, no download                            |
+| `archive`      | full export + download (use for the first run and periodic reconcile) |
+| `sync`         | incremental: export + download only messages newer than last time     |
+| `manifest`     | full export + import manifest, no download                            |
 | `download`     | download all pending media, verify, retry                             |
-| `import FILE`  | import an existing tdl export JSON (no tdl call)                      |
-| `migrate`      | replay old `export/*.json` snapshots into the content table            |
+| `migrate [FILE...]` | legacy: backfill content from JSON-era snapshots in export/, or import given tdl export JSON files; offline, no tdl call |
 | `status`       | counts (total / done / pending / failed) and the failed list          |
 | `reset-failed` | flip every `failed` message back to `pending` for another try         |
 
-Download tunables (on `sync`, `update`, `download`):
+Download tunables (on `archive`, `sync`, `download`):
 
 ```sh
 tgxiv -d DIR download \
@@ -164,20 +163,20 @@ tgxiv -d DIR download \
 
 ## Incremental sync
 
-`update` fetches only messages newer than the last run instead of re-scanning the
+`sync` fetches only messages newer than the last run instead of re-scanning the
 whole channel:
 
 1. Every import records a **watermark**: the highest message id seen, counting
    non-media messages too. A run of trailing text-only posts still advances it,
    so it is not re-scanned next time.
-2. `update` runs an incremental export (`id >= watermark+1`), imports the new
+2. `sync` runs an incremental export (`id >= watermark+1`), imports the new
    media as `pending`, and downloads it, still smallest-first and verified.
-3. On a brand-new archive with no watermark yet, `update` falls back to a full
+3. On a brand-new archive with no watermark yet, `sync` falls back to a full
    export.
 
 Incremental moves forward only. Edits or deletions of older messages keep their
-id and sit below the watermark, so `update` will not notice them. Run a full
-`sync` now and then to reconcile. Backfilling messages older than your first
+id and sit below the watermark, so `sync` will not notice them. Run a full
+`archive` now and then to reconcile. Backfilling messages older than your first
 archived id is out of scope.
 
 ## Interruption and resume
@@ -204,7 +203,8 @@ On the next run:
 
 `export/` only exists in archives made before the DB stored content. `tgxiv
 migrate` replays those snapshots into `archive.db`'s content table (offline, no
-tdl call, files untouched); after that the directory is optional to delete.
+tdl call, files untouched), or imports a tdl export JSON you pass it; after
+that the directory is optional to delete.
 
 ## Web viewer
 

@@ -32,9 +32,9 @@ func (f *dlFlags) apply(c *archive.Config) {
 	c.Limit = f.limit
 }
 
-func newExportCmd() *cobra.Command {
+func newManifestCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "export",
+		Use:   "manifest",
 		Short: "Full tdl export for the channel; import its media manifest into the state DB",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			a, err := openArchive(nil)
@@ -55,67 +55,6 @@ func newExportCmd() *cobra.Command {
 				return err
 			}
 			printExportResult(res)
-			return nil
-		},
-	}
-}
-
-func newImportCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "import <export.json>",
-		Short: "Import an existing tdl export JSON into the state DB (no tdl call)",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			a, err := openArchive(nil)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = a.Close() }()
-
-			added, err := a.Import(args[0])
-			if err != nil {
-				return err
-			}
-			fmt.Printf("imported %s; %d new media messages added to manifest\n", args[0], added)
-			return nil
-		},
-	}
-}
-
-func newMigrateCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "migrate",
-		Short: "Backfill message content in archive.db from kept export JSON snapshots (one-time migration from the JSON era)",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			a, err := openArchive(nil)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = a.Close() }()
-
-			files, err := a.ReplayExports()
-			if err != nil {
-				return err
-			}
-			if files == 0 {
-				fmt.Println("[archive] no export snapshots to replay (this is fine for new archives)")
-				return nil
-			}
-			fmt.Printf("[archive] replayed %d export snapshot(s)\n", files)
-
-			msgs, err := a.Store().MessageCount()
-			if err != nil {
-				return err
-			}
-			counts, err := a.Store().Counts()
-			if err != nil {
-				return err
-			}
-			fmt.Printf("content: %d message(s)\n", msgs)
-			fmt.Printf("total:   %d\n", counts["total"])
-			fmt.Printf("done:    %d\n", counts[store.StatusDone])
-			fmt.Printf("pending: %d\n", counts[store.StatusPending])
-			fmt.Printf("failed:  %d\n", counts[store.StatusFailed])
 			return nil
 		},
 	}
@@ -149,10 +88,10 @@ func newDownloadCmd() *cobra.Command {
 	return cmd
 }
 
-func newSyncCmd() *cobra.Command {
+func newArchiveCmd() *cobra.Command {
 	var f dlFlags
 	cmd := &cobra.Command{
-		Use:   "sync",
+		Use:   "archive",
 		Short: "Full export + download in one step (use for periodic reconciliation)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return exportThenDownload(&f, false)
@@ -162,10 +101,10 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 
-func newUpdateCmd() *cobra.Command {
+func newSyncCmd() *cobra.Command {
 	var f dlFlags
 	cmd := &cobra.Command{
-		Use:   "update",
+		Use:   "sync",
 		Short: "Incremental: fetch and download only messages newer than the last sync",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return exportThenDownload(&f, true)
@@ -176,7 +115,7 @@ func newUpdateCmd() *cobra.Command {
 }
 
 // exportThenDownload runs an export (full or incremental) followed by a download.
-// It is the shared body of the sync and update commands.
+// It is the shared body of the archive and sync commands.
 func exportThenDownload(f *dlFlags, incremental bool) error {
 	a, err := openArchive(f.apply)
 	if err != nil {
