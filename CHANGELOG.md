@@ -30,7 +30,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file can no longer freeze an archive run.
 - `dialog.txt` pointer files inside each media folder keep numeric dialog
   folders human-navigable.
-### Changed
-- The on-disk format is now a pinned contract (see the README); databases
-  created during the pre-release multi-dialog transition gain the
-  `file_name_disk` and `file_hash` columns automatically on first open.
