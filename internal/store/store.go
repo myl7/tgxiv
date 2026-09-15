@@ -157,52 +157,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	if err = upgradeTaskColumns(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("upgrade tasks columns: %w", err)
-	}
 	return &Store{db: db}, nil
-}
-
-// upgradeTaskColumns adds the pre-1.0.0 file_name_disk and file_hash columns
-// to a tasks table created without them — the v3 databases produced after the
-// multi-dialog transition but before the schema freeze. SQLite's ADD COLUMN
-// with a NOT NULL empty-string default backfills existing rows wholesale and
-// takes time independent of table size (file_name_disk empty means "identical
-// to file_name", file_hash empty means "not yet computed"), and no version
-// marker is needed: the columns' presence is itself the marker, and fresh
-// databases are born with them. Two processes opening the same archive
-// (archive + serve) can both observe the missing column and race their
-// ALTERs; the loser sees "duplicate column name" once the winner commits —
-// that is the upgrade succeeding, not failing, so the error is confirmed
-// against a fresh read and tolerated. Each ALTER runs autocommitted (the
-// statement is atomic on its own), so the recheck sees the winner's column.
-func upgradeTaskColumns(db *sql.DB) error {
-	cols, err := tableColumns(db, "tasks")
-	if err != nil {
-		return err
-	}
-	for _, col := range []string{"file_name_disk", "file_hash"} {
-		if cols[col] {
-			continue
-		}
-		if _, err := db.Exec(`ALTER TABLE tasks ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
-			// no stable SQLITE_* code exists for this error, so the driver
-			// message is matched; the recheck still guards a genuinely
-			// foreign failure
-			if !strings.Contains(err.Error(), "duplicate column name") {
-				return err
-			}
-			fresh, cerr := tableColumns(db, "tasks")
-			if cerr != nil {
-				return cerr
-			}
-			if !fresh[col] {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // openDB opens the archive db with every per-connection pragma riding in the
