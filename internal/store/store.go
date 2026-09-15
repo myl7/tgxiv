@@ -31,6 +31,10 @@ const (
 // reference it, tasks reference messages, so an import must create the dialog
 // row before content rows and content rows before manifest rows. task dates
 // are deliberately dropped: the owning message row already carries the date.
+// The tasks file_* family describes the downloaded artifact: file_name is the
+// media-provided name, file_name_disk the locally sanitized on-disk base name
+// recorded only when it differs ("" = identical), and file_hash the SHA-256
+// of the downloaded bytes as lowercase hex ("" = not yet computed).
 const schema = `
 CREATE TABLE IF NOT EXISTS dialogs (
     dialog_id   INTEGER PRIMARY KEY,
@@ -53,17 +57,19 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
-    dialog_id   INTEGER NOT NULL,
-    msg_id      INTEGER NOT NULL,
-    file_name   TEXT    NOT NULL DEFAULT '',
-    size        INTEGER NOT NULL DEFAULT 0,
-    media_type  TEXT    NOT NULL DEFAULT '',
-    status      TEXT    NOT NULL DEFAULT 'pending',
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    actual_size INTEGER NOT NULL DEFAULT 0,
-    path        TEXT    NOT NULL DEFAULT '',
-    error       TEXT    NOT NULL DEFAULT '',
-    updated_at  INTEGER NOT NULL DEFAULT 0,
+    dialog_id      INTEGER NOT NULL,
+    msg_id         INTEGER NOT NULL,
+    file_name      TEXT NOT NULL DEFAULT '',
+    file_name_disk TEXT NOT NULL DEFAULT '',
+    size           INTEGER NOT NULL DEFAULT 0,
+    media_type     TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'pending',
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    actual_size    INTEGER NOT NULL DEFAULT 0,
+    path           TEXT NOT NULL DEFAULT '',
+    file_hash      TEXT NOT NULL DEFAULT '',
+    error          TEXT NOT NULL DEFAULT '',
+    updated_at     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (dialog_id, msg_id),
     FOREIGN KEY (dialog_id, msg_id) REFERENCES messages(dialog_id, msg_id)
 );
@@ -82,26 +88,15 @@ type Dialog struct {
 	UpdatedAt int64
 }
 
-// Record is a message's download-relevant manifest entry.
+// Record is a message's download-relevant manifest entry. FileDiskName is
+// the locally sanitized on-disk base name for FileName, empty when they are
+// identical (the default for every sane media name).
 type Record struct {
-	MsgID     int
-	FileName  string
-	Size      int64
-	MediaType string
-}
-
-// TaskState is a tasks row with its full pipeline state, for one-shot imports
-// (the db migration) that must preserve progress rather than insert as pending.
-type TaskState struct {
-	MsgID      int
-	FileName   string
-	Size       int64
-	MediaType  string
-	Status     string // pending | done | failed
-	Attempts   int
-	ActualSize int64
-	Path       string // root-relative, slash form
-	Error      string
+	MsgID        int
+	FileName     string
+	FileDiskName string // "" = identical to FileName
+	Size         int64
+	MediaType    string
 }
 
 // ContentRecord is one message's viewer-facing content, media or text-only.
@@ -162,7 +157,52 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err = upgradeTaskColumns(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("upgrade tasks columns: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// upgradeTaskColumns adds the pre-1.0.0 file_name_disk and file_hash columns
+// to a tasks table created without them — the v3 databases produced after the
+// multi-dialog transition but before the schema freeze. SQLite's ADD COLUMN
+// with a NOT NULL empty-string default backfills existing rows wholesale and
+// takes time independent of table size (file_name_disk empty means "identical
+// to file_name", file_hash empty means "not yet computed"), and no version
+// marker is needed: the columns' presence is itself the marker, and fresh
+// databases are born with them. Two processes opening the same archive
+// (archive + serve) can both observe the missing column and race their
+// ALTERs; the loser sees "duplicate column name" once the winner commits —
+// that is the upgrade succeeding, not failing, so the error is confirmed
+// against a fresh read and tolerated. Each ALTER runs autocommitted (the
+// statement is atomic on its own), so the recheck sees the winner's column.
+func upgradeTaskColumns(db *sql.DB) error {
+	cols, err := tableColumns(db, "tasks")
+	if err != nil {
+		return err
+	}
+	for _, col := range []string{"file_name_disk", "file_hash"} {
+		if cols[col] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE tasks ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+			// no stable SQLITE_* code exists for this error, so the driver
+			// message is matched; the recheck still guards a genuinely
+			// foreign failure
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
+			fresh, cerr := tableColumns(db, "tasks")
+			if cerr != nil {
+				return cerr
+			}
+			if !fresh[col] {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // openDB opens the archive db with every per-connection pragma riding in the
@@ -340,10 +380,12 @@ ON CONFLICT(dialog_id, msg_id) DO UPDATE SET
 }
 
 // UpsertManifest inserts new tasks as pending and refreshes the manifest
-// fields (name, size, type) of existing ones without touching their status,
-// attempts, or download result. Returns how many rows were newly inserted.
-// Runs in a single transaction. The FK on tasks enforces that every message
-// already has a content row; callers must not add a redundant pre-check.
+// fields (name, disk name, size, type) of existing ones without touching
+// their status, attempts, or download result (file_hash included: a hash
+// already computed for the previous download of the same message survives a
+// re-export). Returns how many rows were newly inserted. Runs in a single
+// transaction. The FK on tasks enforces that every message already has a
+// content row; callers must not add a redundant pre-check.
 func (s *Store) UpsertManifest(dialogID int64, recs []Record) (added int, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -364,12 +406,13 @@ func (s *Store) UpsertManifest(dialogID int64, recs []Record) (added int, err er
 	defer func() { _ = existsStmt.Close() }()
 
 	upStmt, err := tx.Prepare(`
-INSERT INTO tasks (dialog_id, msg_id, file_name, size, media_type, status, updated_at)
-VALUES (?, ?, ?, ?, ?, 'pending', ?)
+INSERT INTO tasks (dialog_id, msg_id, file_name, file_name_disk, size, media_type, status, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
 ON CONFLICT(dialog_id, msg_id) DO UPDATE SET
-    file_name  = excluded.file_name,
-    size       = excluded.size,
-    media_type = excluded.media_type`)
+    file_name      = excluded.file_name,
+    file_name_disk = excluded.file_name_disk,
+    size           = excluded.size,
+    media_type     = excluded.media_type`)
 	if err != nil {
 		return 0, err
 	}
@@ -386,7 +429,7 @@ ON CONFLICT(dialog_id, msg_id) DO UPDATE SET
 		default:
 			return 0, scanErr
 		}
-		if _, err = upStmt.Exec(dialogID, r.MsgID, r.FileName, r.Size, r.MediaType, now); err != nil {
+		if _, err = upStmt.Exec(dialogID, r.MsgID, r.FileName, r.FileDiskName, r.Size, r.MediaType, now); err != nil {
 			return 0, err
 		}
 	}
@@ -395,40 +438,6 @@ ON CONFLICT(dialog_id, msg_id) DO UPDATE SET
 		return 0, err
 	}
 	return added, nil
-}
-
-// ImportTasks inserts the dialog's tasks with their full state in one
-// transaction. On (dialog_id,msg_id) conflict the existing row wins entirely —
-// a --force re-run must not rewind progress made between runs. The FK on tasks
-// enforces that every message already has a content row.
-func (s *Store) ImportTasks(dialogID int64, tasks []TaskState) (err error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-
-	stmt, err := tx.Prepare(`
-INSERT INTO tasks (dialog_id, msg_id, file_name, size, media_type, status, attempts, actual_size, path, error, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(dialog_id, msg_id) DO NOTHING`)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = stmt.Close() }()
-
-	now := time.Now().Unix()
-	for _, t := range tasks {
-		if _, err = stmt.Exec(dialogID, t.MsgID, t.FileName, t.Size, t.MediaType,
-			t.Status, t.Attempts, t.ActualSize, t.Path, t.Error, now); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }
 
 // MessageCount returns how many messages the dialog has content rows for,
@@ -445,7 +454,7 @@ func (s *Store) MessageCount(dialogID int64) (int, error) {
 // (smallest first), then by msg_id for a stable order among equal sizes.
 func (s *Store) ListPending(dialogID int64) ([]Record, error) {
 	rows, err := s.db.Query(`
-SELECT msg_id, file_name, size, media_type
+SELECT msg_id, file_name, file_name_disk, size, media_type
 FROM tasks WHERE dialog_id = ? AND status = 'pending'
 ORDER BY size ASC, msg_id ASC`, dialogID)
 	if err != nil {
@@ -456,7 +465,7 @@ ORDER BY size ASC, msg_id ASC`, dialogID)
 	var out []Record
 	for rows.Next() {
 		var r Record
-		if err := rows.Scan(&r.MsgID, &r.FileName, &r.Size, &r.MediaType); err != nil {
+		if err := rows.Scan(&r.MsgID, &r.FileName, &r.FileDiskName, &r.Size, &r.MediaType); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -464,11 +473,14 @@ ORDER BY size ASC, msg_id ASC`, dialogID)
 	return out, rows.Err()
 }
 
-// MarkDone records a successful, size-verified download.
-func (s *Store) MarkDone(dialogID int64, msgID int, actualSize int64, path string) error {
+// MarkDone records a successful, size-verified download. fileHash is the
+// SHA-256 of the downloaded bytes as lowercase hex; the only empty value ever
+// stored by a live pipeline is the pre-freeze default — a hash that failed to
+// compute is the caller's error to surface, never a value to swallow.
+func (s *Store) MarkDone(dialogID int64, msgID int, actualSize int64, path, fileHash string) error {
 	_, err := s.db.Exec(`
-UPDATE tasks SET status='done', actual_size=?, path=?, error='', updated_at=?
-WHERE dialog_id=? AND msg_id=?`, actualSize, path, time.Now().Unix(), dialogID, msgID)
+UPDATE tasks SET status='done', actual_size=?, path=?, file_hash=?, error='', updated_at=?
+WHERE dialog_id=? AND msg_id=?`, actualSize, path, fileHash, time.Now().Unix(), dialogID, msgID)
 	return err
 }
 
@@ -501,8 +513,10 @@ func (s *Store) Attempts(dialogID int64, msgID int) (n int, ok bool, err error) 
 }
 
 // ResetTask flips the dialog's task for msgID back to pending with attempts
-// zeroed and the error cleared, regardless of its prior status. ok is false
-// when no such task row exists.
+// zeroed and the error cleared, regardless of its prior status. file_hash is
+// deliberately kept: it describes the file that was there before the reset,
+// and the next MarkDone overwrites it. ok is false when no such task row
+// exists.
 func (s *Store) ResetTask(dialogID int64, msgID int) (bool, error) {
 	res, err := s.db.Exec(`
 UPDATE tasks SET status='pending', attempts=0, error=''

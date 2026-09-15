@@ -2,12 +2,15 @@ package archive
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -178,6 +181,60 @@ func TestDownloadStoresRelativeMediaPath(t *testing.T) {
 	}
 	if path != "media/100/1_f" {
 		t.Errorf("stored path = %q, want media/100/1_f", path)
+	}
+}
+
+// TestDownloadStoresFileHash checks the content-integrity model end to end:
+// every completed download is hashed at the MarkDone choke point, and the
+// stored digest matches one computed independently (sha256.Sum256, not the
+// streaming helper) over the verified file's bytes.
+func TestDownloadStoresFileHash(t *testing.T) {
+	fake := &fakeRunner{writeSize: map[int]int{1: 1}}
+	a := setup(t, Config{BatchSize: 10, MaxAttempts: 2}, fake, recsWithSizeEqualsID(1))
+
+	if _, err := a.Download(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(a.cfg.dialogMediaDir(100), "1_f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(b)
+	want := hex.EncodeToString(digest[:])
+
+	db, err := sql.Open("sqlite", a.cfg.dbPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var got string
+	if err := db.QueryRow(`SELECT file_hash FROM tasks WHERE dialog_id = 100 AND msg_id = 1`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("file_hash = %q, want the sha256 of the file %q", got, want)
+	}
+	if len(got) != 64 || got != strings.ToLower(got) {
+		t.Errorf("file_hash = %q, want 64 chars of lowercase hex", got)
+	}
+}
+
+func TestHashFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "f")
+	if err := os.WriteFile(p, []byte("tgxiv"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("tgxiv"))
+	want := hex.EncodeToString(digest[:])
+	got, err := hashFile(p)
+	if err != nil || got != want {
+		t.Errorf("hashFile = %q, %v; want %q, nil", got, err, want)
+	}
+	// a just-verified file whose hash I/O fails is an error the run surfaces,
+	// never an empty digest to swallow
+	if _, err := hashFile(filepath.Join(dir, "missing")); err == nil {
+		t.Error("hashFile on a missing file: want an error, got nil")
 	}
 }
 
@@ -1042,5 +1099,147 @@ func TestExportRefreshesDialogMeta(t *testing.T) {
 	}
 	if d.Username != "somechannel" || d.Title != "Some Channel" || d.Kind != "channel" {
 		t.Errorf("dialog = %+v, want chat ls metadata after export", d)
+	}
+}
+
+// TestWriteBatchPrefersDiskName pins what tdl is told to name files: the
+// stored sanitized disk name when one exists, the media-provided name
+// verbatim otherwise, and the legacy "media" placeholder for nameless
+// records that predate disk names.
+func TestWriteBatchPrefersDiskName(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "batch.json")
+	recs := []store.Record{
+		{MsgID: 1, FileName: "a/b.jpg", FileDiskName: "a_b.jpg", Size: 1},
+		{MsgID: 2, FileName: "clip.mp4", Size: 2},
+		{MsgID: 3, Size: 3},
+	}
+	if err := writeBatch(p, 100, recs); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var content batchFileContent
+	if err := json.Unmarshal(b, &content); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a_b.jpg", "clip.mp4", "media"}
+	if len(content.Messages) != len(want) {
+		t.Fatalf("batch = %+v, want %d messages", content.Messages, len(want))
+	}
+	for i, m := range content.Messages {
+		if m.File != want[i] {
+			t.Errorf("message %d file = %q, want %q", m.ID, m.File, want[i])
+		}
+	}
+}
+
+// namingExportJSON: a name that needs sanitizing (separators plus a
+// Windows-forbidden colon) and a sane one that must stay verbatim.
+const namingExportJSON = `{"id":100,"messages":[
+ {"id":1,"type":"message","file":"we/ird:name.mp4","raw":{"ID":1,"Media":{"Document":{"ID":1,"Size":30,"Attributes":[{"FileName":"we/ird:name.mp4"}]}}}},
+ {"id":2,"type":"message","file":"n.jpg","raw":{"ID":2,"Media":{"Document":{"ID":2,"Size":20,"Attributes":[{"FileName":"n.jpg"}]}}}}
+]}`
+
+// TestImportComputesDiskNames covers the import-side naming: file_name_disk
+// is recorded only when the sanitized name differs from the media-provided
+// one, and the download then lands files under exactly that stored name.
+func TestImportComputesDiskNames(t *testing.T) {
+	a := openBare(t, &fakeRunner{})
+	path := filepath.Join(t.TempDir(), "delta.json")
+	if err := os.WriteFile(path, []byte(namingExportJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Import(path); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, _ := a.store.ListPending(100)
+	if len(pending) != 2 {
+		t.Fatalf("pending = %d, want 2", len(pending))
+	}
+	byID := map[int]store.Record{}
+	for _, r := range pending {
+		byID[r.MsgID] = r
+	}
+	if r := byID[1]; r.FileDiskName != "we_ird_name.mp4" {
+		t.Errorf("msg 1 FileDiskName = %q, want we_ird_name.mp4", r.FileDiskName)
+	}
+	if r := byID[2]; r.FileDiskName != "" {
+		t.Errorf("msg 2 FileDiskName = %q, want \"\" (sane name stored verbatim)", r.FileDiskName)
+	}
+
+	// end to end: tdl is handed the disk names and the files land under them
+	a.runner = &fakeRunner{writeSize: map[int]int{1: 30, 2: 20}}
+	if _, err := a.Download(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"1_we_ird_name.mp4", "2_n.jpg"} {
+		if _, err := os.Stat(filepath.Join(a.cfg.dialogMediaDir(100), name)); err != nil {
+			t.Errorf("media %s: %v", name, err)
+		}
+	}
+}
+
+// TestDownloadLongPathHint covers the one naming failure sanitization cannot
+// prevent: the archive root sits so deep that the would-be on-disk path
+// busts Windows' effective 260-unit limit, the file never lands, and the
+// recorded attempt error says why — on Windows; elsewhere the hint is gated
+// off and the miss stays a plain miss. Control flow is untouched either way:
+// an ordinary failed attempt through the normal pipeline, not a run abort.
+func TestDownloadLongPathHint(t *testing.T) {
+	deep := filepath.Join(t.TempDir(), strings.Repeat("d", 230))
+	a, err := Open(Config{Dir: deep, BatchSize: 10, MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	// no writeSize: the fake "fails to create" the file, so verify finds none
+	a.runner = &fakeRunner{}
+	seedDialog(t, a, 100, recsWithSizeEqualsID(1))
+
+	if _, err := a.Download(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok, _ := a.store.Attempts(100, 1); !ok || n != 3 {
+		t.Fatalf("attempts = %d (ok %v), want 3 (ordinary attempts, then failed)", n, ok)
+	}
+	taskErr := func(t *testing.T, dir string, dialogID int64, msgID int) string {
+		t.Helper()
+		db, err := sql.Open("sqlite", filepath.Join(dir, dbName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db.Close() }()
+		var errMsg string
+		if err := db.QueryRow(`SELECT error FROM tasks WHERE dialog_id = ? AND msg_id = ?`, dialogID, msgID).Scan(&errMsg); err != nil {
+			t.Fatal(err)
+		}
+		return errMsg
+	}
+	if got := taskErr(t, deep, 100, 1); !strings.Contains(got, "no file found") {
+		t.Errorf("error = %q, want the recorded miss", got)
+	}
+	// the hint itself is Windows-only (longPathHint's GOOS gate): elsewhere
+	// a >260-unit path is usually perfectly legal, so asserting it would
+	// both mislead the user and fail the test
+	if runtime.GOOS == "windows" {
+		if got := taskErr(t, deep, 100, 1); !strings.Contains(got, "the archive root path may be too long for this filesystem") {
+			t.Errorf("error = %q, want the long-path hint on Windows", got)
+		}
+	} else if got := taskErr(t, deep, 100, 1); strings.Contains(got, "too long") {
+		t.Errorf("error = %q; the hint must not fire off Windows", got)
+	}
+
+	// a shallow root's plain miss carries no hint: it must name the user's
+	// root problem, not decorate every miss
+	shallow := setup(t, Config{BatchSize: 10, MaxAttempts: 1}, &fakeRunner{}, recsWithSizeEqualsID(1))
+	if _, err := shallow.Download(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := taskErr(t, shallow.cfg.Dir, 100, 1); !strings.Contains(got, "no file found") ||
+		strings.Contains(got, "too long") {
+		t.Errorf("shallow-root error = %q, want the plain miss without the hint", got)
 	}
 }

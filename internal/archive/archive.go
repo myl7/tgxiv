@@ -5,9 +5,12 @@ package archive
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -310,6 +313,15 @@ func (a *Archive) Import(path string) (added int, err error) {
 	})
 	if err != nil {
 		return 0, fmt.Errorf("parse export: %w", err)
+	}
+
+	// The on-disk names are decided here and stored with the manifest, so
+	// every later download or retry settles on the same name: sanitized when
+	// the media-provided name needs any change, a UUID fallback for the
+	// nameless/garbage-only, and "" ("identical to file_name") — the stored
+	// default — for every name that needs no change at all.
+	for i := range recs {
+		recs[i].FileDiskName = diskNameFor(recs[i].FileName)
 	}
 
 	// dialogs -> messages -> tasks is the FK order: the dialog row must land
@@ -618,7 +630,14 @@ func (a *Archive) runBatches(ctx context.Context, dialogID int64, batches [][]st
 			}
 			switch {
 			case vr.matched:
-				if err := a.store.MarkDone(dialogID, r.MsgID, vr.actualSize, a.mediaStorePath(dialogID, vr.path)); err != nil {
+				// hash at the single choke point every success passes
+				// through; a just-verified file whose hash I/O fails is a
+				// real error worth failing the run, never swallowed
+				sum, err := hashFile(vr.path)
+				if err != nil {
+					return done, lastBatchErr, fmt.Errorf("hash %s: %w", vr.path, err)
+				}
+				if err := a.store.MarkDone(dialogID, r.MsgID, vr.actualSize, a.mediaStorePath(dialogID, vr.path), sum); err != nil {
 					return done, lastBatchErr, err
 				}
 				done++
@@ -633,6 +652,9 @@ func (a *Archive) runBatches(ctx context.Context, dialogID int64, batches [][]st
 			default:
 				// tdl succeeded but the file is missing or wrong size
 				msg := fmt.Sprintf("expected %d bytes, got %d (%s)", r.Size, vr.actualSize, describeMiss(vr))
+				if vr.path == "" {
+					msg += longPathHint(mediaDir, r)
+				}
 				if err := a.store.MarkAttempt(dialogID, r.MsgID, vr.actualSize, msg, a.cfg.MaxAttempts); err != nil {
 					return done, lastBatchErr, err
 				}
@@ -640,6 +662,24 @@ func (a *Archive) runBatches(ctx context.Context, dialogID int64, batches [][]st
 		}
 	}
 	return done, lastBatchErr, nil
+}
+
+// hashFile streams path through SHA-256 and returns the digest as lowercase
+// hex. It copies with io.Copy — a media file may be gigabytes, so reading it
+// into memory whole to hash it would dwarf the pipeline's footprint — and
+// the cost is invisible anyway: SHA-NI hardware hashes at GB/s, roughly 30x
+// the pipeline's network download rate, so the hash never gates a download.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // mediaStorePath converts an on-disk media file path into the root-relative
@@ -864,14 +904,26 @@ type batchFileContent struct {
 	Messages []batchMessage `json:"messages"`
 }
 
+// batchFileName resolves the file name writeBatch hands tdl for a record:
+// the locally sanitized disk name when one was recorded, else the
+// media-provided name unchanged, else the legacy "media" placeholder for
+// nameless records that predate disk names. tdl receives a name whose
+// characters the sanitizer already cleared for the local filesystem, and
+// names it "<msgID>_<file>" per dlTemplate.
+func batchFileName(r store.Record) string {
+	if r.FileDiskName != "" {
+		return r.FileDiskName
+	}
+	if r.FileName != "" {
+		return r.FileName
+	}
+	return "media"
+}
+
 func writeBatch(path string, channelID int64, batch []store.Record) error {
 	content := batchFileContent{ID: channelID, Messages: make([]batchMessage, 0, len(batch))}
 	for _, r := range batch {
-		file := r.FileName
-		if file == "" {
-			file = "media"
-		}
-		content.Messages = append(content.Messages, batchMessage{ID: r.MsgID, Type: "message", File: file})
+		content.Messages = append(content.Messages, batchMessage{ID: r.MsgID, Type: "message", File: batchFileName(r)})
 	}
 	b, err := json.Marshal(content)
 	if err != nil {

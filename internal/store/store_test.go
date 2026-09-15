@@ -18,6 +18,10 @@ func openTemp(t *testing.T) *Store {
 	return s
 }
 
+// testFileHash is the SHA-256 of the empty input: a real, well-formed digest
+// for tests that only need the column round-tripped.
+const testFileHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 // indexNames lists the non-internal indexes attached to table.
 func indexNames(t *testing.T, db *sql.DB, table string) []string {
 	t.Helper()
@@ -192,7 +196,7 @@ func TestMarkDoneRemovesFromPending(t *testing.T) {
 	seedDialog(t, s, 1)
 	seedTasks(t, s, 1)
 
-	if err := s.MarkDone(100, 1, 10, "/x/100_1_a.jpg"); err != nil {
+	if err := s.MarkDone(100, 1, 10, "/x/100_1_a.jpg", testFileHash); err != nil {
 		t.Fatal(err)
 	}
 	pending, _ := s.ListPending(100)
@@ -202,6 +206,38 @@ func TestMarkDoneRemovesFromPending(t *testing.T) {
 	counts, _ := s.CountsAll()
 	if counts[StatusDone] != 1 {
 		t.Errorf("done = %d, want 1", counts[StatusDone])
+	}
+}
+
+// TestMarkDoneStoresFileHash pins the stored form of the digest: lowercase
+// hex, stored verbatim, and overwritten by the next MarkDone — never a value
+// the pipeline silently clears.
+func TestMarkDoneStoresFileHash(t *testing.T) {
+	s := openTemp(t)
+	seedDialog(t, s, 1)
+	seedTasks(t, s, 1)
+
+	hashA := strings.Repeat("ab32", 16) // 64 chars of well-formed lowercase hex
+	if err := s.MarkDone(100, 1, 10, "media/100/1_f", hashA); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := s.db.QueryRow(`SELECT file_hash FROM tasks WHERE dialog_id=100 AND msg_id=1`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != hashA {
+		t.Errorf("file_hash = %q, want %q stored verbatim", got, hashA)
+	}
+
+	hashB := strings.Repeat("cd97", 16)
+	if err := s.MarkDone(100, 1, 10, "media/100/1_f", hashB); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT file_hash FROM tasks WHERE dialog_id=100 AND msg_id=1`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != hashB {
+		t.Errorf("file_hash after re-download = %q, want %q (the next MarkDone overwrites)", got, hashB)
 	}
 }
 
@@ -309,33 +345,58 @@ func TestUpsertManifestRefreshKeepsStatus(t *testing.T) {
 	if err := s.MarkAttempt(100, 1, 4, "short", 5); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkDone(100, 1, 10, "media/100_1_a.jpg"); err != nil {
+	if err := s.MarkDone(100, 1, 10, "media/100_1_a.jpg", testFileHash); err != nil {
 		t.Fatal(err)
 	}
 
-	// a later export re-states the manifest: progress and result must survive
-	if _, err := s.UpsertManifest(100, []Record{{MsgID: 1, FileName: "renamed.jpg", Size: 10, MediaType: "photo"}}); err != nil {
+	// a later export re-states the manifest: progress, result, and the
+	// already-computed hash must all survive, while the names refresh
+	if _, err := s.UpsertManifest(100, []Record{{MsgID: 1, FileName: "re:named.jpg", FileDiskName: "re_named.jpg", Size: 10, MediaType: "photo"}}); err != nil {
 		t.Fatal(err)
 	}
 	var status string
 	var attempts int
 	var actualSize int64
-	var path string
+	var path, fileHash string
 	if err := s.db.QueryRow(`
-SELECT status, attempts, actual_size, path FROM tasks WHERE dialog_id=100 AND msg_id=1`).
-		Scan(&status, &attempts, &actualSize, &path); err != nil {
+SELECT status, attempts, actual_size, path, file_hash FROM tasks WHERE dialog_id=100 AND msg_id=1`).
+		Scan(&status, &attempts, &actualSize, &path, &fileHash); err != nil {
 		t.Fatal(err)
 	}
-	if status != StatusDone || attempts != 2 || actualSize != 10 || path != "media/100_1_a.jpg" {
-		t.Errorf("task = %s attempts=%d actual=%d path=%q; want done/2/10/media/100_1_a.jpg", status, attempts, actualSize, path)
+	if status != StatusDone || attempts != 2 || actualSize != 10 || path != "media/100_1_a.jpg" || fileHash != testFileHash {
+		t.Errorf("task = %s attempts=%d actual=%d path=%q hash=%q; want done/2/10/media/100_1_a.jpg/%s", status, attempts, actualSize, path, fileHash, testFileHash)
 	}
-	var name string
+	var name, diskName string
 	var size int64
-	if err := s.db.QueryRow(`SELECT file_name, size FROM tasks WHERE dialog_id=100 AND msg_id=1`).Scan(&name, &size); err != nil {
+	if err := s.db.QueryRow(`SELECT file_name, file_name_disk, size FROM tasks WHERE dialog_id=100 AND msg_id=1`).Scan(&name, &diskName, &size); err != nil {
 		t.Fatal(err)
 	}
-	if name != "renamed.jpg" || size != 10 {
-		t.Errorf("manifest fields = %q,%d; want the refreshed values", name, size)
+	if name != "re:named.jpg" || diskName != "re_named.jpg" || size != 10 {
+		t.Errorf("manifest fields = %q,%q,%d; want the refreshed values", name, diskName, size)
+	}
+}
+
+// TestListPendingReturnsDiskName checks the disk name round-trips through the
+// manifest: stored on upsert, selected back with the pending set.
+func TestListPendingReturnsDiskName(t *testing.T) {
+	s := openTemp(t)
+	seedDialog(t, s, 1, 2)
+
+	if _, err := s.UpsertManifest(100, []Record{
+		{MsgID: 1, FileName: "a/b.jpg", FileDiskName: "a_b.jpg", Size: 5},
+		{MsgID: 2, FileName: "n.jpg", Size: 6}, // empty stays empty — identical name
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := s.ListPending(100)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("pending = %v, %v; want two rows", pending, err)
+	}
+	if pending[0].FileDiskName != "a_b.jpg" {
+		t.Errorf("msg 1 FileDiskName = %q, want a_b.jpg", pending[0].FileDiskName)
+	}
+	if pending[1].FileDiskName != "" {
+		t.Errorf("msg 2 FileDiskName = %q, want \"\"", pending[1].FileDiskName)
 	}
 }
 
@@ -345,7 +406,7 @@ func TestResetTask(t *testing.T) {
 	seedTasks(t, s, 1, 2)
 
 	// msg 1 done, msg 2 failed at max attempts
-	if err := s.MarkDone(100, 1, 10, "/x"); err != nil {
+	if err := s.MarkDone(100, 1, 10, "/x", testFileHash); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
@@ -361,14 +422,19 @@ func TestResetTask(t *testing.T) {
 		}
 		var status string
 		var attempts int
-		var errMsg string
+		var errMsg, fileHash string
 		if err := s.db.QueryRow(`
-SELECT status, attempts, error FROM tasks WHERE dialog_id=100 AND msg_id=?`, id).
-			Scan(&status, &attempts, &errMsg); err != nil {
+SELECT status, attempts, error, file_hash FROM tasks WHERE dialog_id=100 AND msg_id=?`, id).
+			Scan(&status, &attempts, &errMsg, &fileHash); err != nil {
 			t.Fatal(err)
 		}
 		if status != StatusPending || attempts != 0 || errMsg != "" {
 			t.Errorf("task %d after reset = %s,%d,%q; want pending,0,\"\"", id, status, attempts, errMsg)
+		}
+		// the hash describes the file that WAS there; the reset keeps it and
+		// the next MarkDone overwrites it
+		if want := map[int]string{1: testFileHash, 2: ""}[id]; fileHash != want {
+			t.Errorf("task %d file_hash after reset = %q, want %q (kept)", id, fileHash, want)
 		}
 	}
 
@@ -394,10 +460,10 @@ func TestCountsAcrossDialogs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.MarkDone(100, 1, 1, "/x"); err != nil {
+	if err := s.MarkDone(100, 1, 1, "/x", testFileHash); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.MarkDone(200, 1, 1, "/x"); err != nil {
+	if err := s.MarkDone(200, 1, 1, "/x", testFileHash); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
@@ -496,12 +562,13 @@ func TestOpenFreshAppliesV3(t *testing.T) {
 		}
 	}
 
-	// tasks drops v2's redundant dialog_id-in-downloads date column
+	// tasks drops v2's redundant dialog_id-in-downloads date column and
+	// carries the 1.0.0 file_* family alongside file_name
 	taskCols, err := tableColumns(s.db, "tasks")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, col := range []string{"dialog_id", "msg_id", "file_name", "size", "media_type", "status", "attempts", "actual_size", "path", "error", "updated_at"} {
+	for _, col := range []string{"dialog_id", "msg_id", "file_name", "file_name_disk", "size", "media_type", "status", "attempts", "actual_size", "path", "file_hash", "error", "updated_at"} {
 		if !taskCols[col] {
 			t.Errorf("tasks column %q missing", col)
 		}
@@ -583,60 +650,116 @@ func TestOpenRejectsV2Layout(t *testing.T) {
 	}
 }
 
-func TestImportTasks(t *testing.T) {
-	s := openTemp(t)
-	seedDialog(t, s, 1, 2)
+// preFreezeV3Schema is the v3 layout exactly as the pre-1.0.0 builds created
+// it: dialogs present (so it is not v2) but tasks without the file_name_disk
+// and file_hash columns the freeze added.
+const preFreezeV3Schema = `
+CREATE TABLE dialogs (
+    dialog_id   INTEGER PRIMARY KEY,
+    username    TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL DEFAULT '',
+    last_msg_id INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE messages (
+    dialog_id INTEGER NOT NULL REFERENCES dialogs(dialog_id),
+    msg_id    INTEGER NOT NULL,
+    type      TEXT    NOT NULL DEFAULT 'message',
+    date      INTEGER NOT NULL DEFAULT 0,
+    text      TEXT    NOT NULL DEFAULT '',
+    file      TEXT    NOT NULL DEFAULT '',
+    raw       TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (dialog_id, msg_id)
+);
+CREATE TABLE tasks (
+    dialog_id   INTEGER NOT NULL,
+    msg_id      INTEGER NOT NULL,
+    file_name   TEXT    NOT NULL DEFAULT '',
+    size        INTEGER NOT NULL DEFAULT 0,
+    media_type  TEXT    NOT NULL DEFAULT '',
+    status      TEXT    NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    actual_size INTEGER NOT NULL DEFAULT 0,
+    path        TEXT    NOT NULL DEFAULT '',
+    error       TEXT    NOT NULL DEFAULT '',
+    updated_at  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (dialog_id, msg_id),
+    FOREIGN KEY (dialog_id, msg_id) REFERENCES messages(dialog_id, msg_id)
+);`
 
-	// a full-state import: one done with burned attempts and a verified path,
-	// one failed with its error kept — neither may be flattened to pending
-	if err := s.ImportTasks(100, []TaskState{
-		{MsgID: 1, FileName: "a.jpg", Size: 10, MediaType: "photo", Status: StatusDone, Attempts: 2, ActualSize: 10, Path: "media/100/1_a.jpg"},
-		{MsgID: 2, FileName: "b.mp4", Size: 20, MediaType: "document", Status: StatusFailed, Attempts: 3, Error: "size mismatch"},
-	}); err != nil {
+// TestOpenUpgradesPreFreezeTasks covers the silent one-time upgrade of the
+// user's already-converted early v3 databases: on open, the missing columns
+// appear via ALTER TABLE, existing rows stay readable with the empty-string
+// backfill, the upgraded db accepts new writes, and reopening is a no-op.
+func TestOpenUpgradesPreFreezeTasks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tgxiv.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open pre-freeze db: %v", err)
+	}
+	if _, err := db.Exec(preFreezeV3Schema); err != nil {
+		t.Fatalf("pre-freeze schema: %v", err)
+	}
+	// a done row with recorded progress: it must survive the upgrade intact
+	if _, err := db.Exec(`INSERT INTO dialogs (dialog_id) VALUES (100)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (dialog_id, msg_id, raw) VALUES (100, 1, '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+INSERT INTO tasks (dialog_id, msg_id, file_name, status, attempts, actual_size, path)
+VALUES (100, 1, 'a.jpg', 'done', 2, 10, 'media/100/1_a.jpg')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	var status string
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a pre-freeze v3 db: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	cols, err := tableColumns(s.db, "tasks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cols["file_name_disk"] || !cols["file_hash"] {
+		t.Fatalf("upgraded tasks columns = %v; want file_name_disk and file_hash present", cols)
+	}
+	var status, diskName, fileHash, taskPath string
 	var attempts int
-	var actualSize int64
-	var taskPath, errMsg string
 	if err := s.db.QueryRow(`
-SELECT status, attempts, actual_size, path, error FROM tasks WHERE dialog_id=100 AND msg_id=1`).
-		Scan(&status, &attempts, &actualSize, &taskPath, &errMsg); err != nil {
+SELECT status, attempts, file_name_disk, file_hash, path FROM tasks WHERE dialog_id=100 AND msg_id=1`).
+		Scan(&status, &attempts, &diskName, &fileHash, &taskPath); err != nil {
 		t.Fatal(err)
 	}
-	if status != StatusDone || attempts != 2 || actualSize != 10 || taskPath != "media/100/1_a.jpg" || errMsg != "" {
-		t.Errorf("task 1 = %s,%d,%d,%q,%q; want done,2,10,media/100/1_a.jpg,\"\"", status, attempts, actualSize, taskPath, errMsg)
-	}
-	if err := s.db.QueryRow(`
-SELECT status, attempts, path, error FROM tasks WHERE dialog_id=100 AND msg_id=2`).
-		Scan(&status, &attempts, &taskPath, &errMsg); err != nil {
-		t.Fatal(err)
-	}
-	if status != StatusFailed || attempts != 3 || taskPath != "" || errMsg != "size mismatch" {
-		t.Errorf("task 2 = %s,%d,%q,%q; want failed,3,\"\",size mismatch", status, attempts, taskPath, errMsg)
+	if status != StatusDone || attempts != 2 || taskPath != "media/100/1_a.jpg" || diskName != "" || fileHash != "" {
+		t.Errorf("row after upgrade = %s,%d,%q,%q,%q; want the recorded progress kept and the columns backfilled to ''",
+			status, attempts, diskName, fileHash, taskPath)
 	}
 
-	// conflict: re-importing msg 1 as a fresh pending row must not rewind the
-	// recorded progress
-	if err := s.ImportTasks(100, []TaskState{
-		{MsgID: 1, FileName: "a.jpg", Size: 10, MediaType: "photo", Status: StatusPending},
-	}); err != nil {
+	// the upgraded db is fully writable: a fresh manifest row round-trips
+	if err := s.UpsertContent(100, []ContentRecord{{MsgID: 2, Type: "message", Raw: `{"id":2}`}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.db.QueryRow(`
-SELECT status, attempts, actual_size, path FROM tasks WHERE dialog_id=100 AND msg_id=1`).
-		Scan(&status, &attempts, &actualSize, &taskPath); err != nil {
+	if _, err := s.UpsertManifest(100, []Record{{MsgID: 2, FileName: "x:y.jpg", FileDiskName: "x_y.jpg", Size: 5}}); err != nil {
 		t.Fatal(err)
 	}
-	if status != StatusDone || attempts != 2 || actualSize != 10 || taskPath != "media/100/1_a.jpg" {
-		t.Errorf("task 1 after conflict = %s,%d,%d,%q; want done,2,10,media/100/1_a.jpg (existing row wins)", status, attempts, actualSize, taskPath)
+	pending, err := s.ListPending(100)
+	if err != nil || len(pending) != 1 || pending[0].FileDiskName != "x_y.jpg" {
+		t.Fatalf("pending on upgraded db = %v, %v; want msg 2 with its disk name", pending, err)
 	}
 
-	// the FK still applies: a task for a message with no content row is rejected
-	if err := s.ImportTasks(100, []TaskState{{MsgID: 99, Status: StatusPending}}); err == nil {
-		t.Error("ImportTasks with no content row: want an FK error, got nil")
+	// reopen: the columns exist now, so the upgrade must be a silent no-op
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen upgraded db: %v", err)
 	}
+	defer func() { _ = s2.Close() }()
 }
 
 func TestUpsertContentLastWins(t *testing.T) {

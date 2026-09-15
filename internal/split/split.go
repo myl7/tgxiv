@@ -248,8 +248,8 @@ func moveDialogs(db *sql.DB, src, dst string, ids []int64) error {
 	if err != nil {
 		return fmt.Errorf("copy messages: %w", err)
 	}
-	nTask, err := execTx(tx, "INSERT INTO dstx.tasks (dialog_id, msg_id, file_name, size, media_type, status, attempts, actual_size, path, error, updated_at) "+
-		"SELECT dialog_id, msg_id, file_name, size, media_type, status, attempts, actual_size, path, error, updated_at FROM main.tasks WHERE "+where, args)
+	nTask, err := execTx(tx, "INSERT INTO dstx.tasks (dialog_id, msg_id, file_name, file_name_disk, size, media_type, status, attempts, actual_size, path, file_hash, error, updated_at) "+
+		"SELECT dialog_id, msg_id, file_name, file_name_disk, size, media_type, status, attempts, actual_size, path, file_hash, error, updated_at FROM main.tasks WHERE "+where, args)
 	if err != nil {
 		return fmt.Errorf("copy tasks: %w", err)
 	}

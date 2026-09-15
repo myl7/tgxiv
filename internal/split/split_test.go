@@ -38,10 +38,19 @@ func seedRoot(t *testing.T, root string, ids ...int64) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.ImportTasks(id, []store.TaskState{
-			{MsgID: 10, FileName: "a.jpg", Size: 3, MediaType: "photo", Status: store.StatusDone, ActualSize: 3, Path: "media/" + chat + "/10_a.jpg"},
-			{MsgID: 11, FileName: "b.mp4", Size: 4, MediaType: "video", Status: store.StatusPending},
+		if _, err := st.UpsertManifest(id, []store.Record{
+			{MsgID: 10, FileName: "a.jpg", Size: 3, MediaType: "photo"},
+			{MsgID: 11, FileName: "b:mp4", FileDiskName: "b_mp4", Size: 4, MediaType: "video"},
 		}); err != nil {
+			t.Fatal(err)
+		}
+		// done/pending states and the freeze-era columns ride through the
+		// live pipeline API, exactly as a real archive would have written them
+		if err := st.MarkDone(id, 10, 3, "media/"+chat+"/10_a.jpg",
+			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkAttempt(id, 11, 0, "boom", 3); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.AdvanceLastMsgID(id, 42); err != nil {
@@ -151,6 +160,14 @@ func TestRunMovesDialogs(t *testing.T) {
 	// task paths are root-relative and stay unchanged
 	if p := queryString(t, ddb, `SELECT path FROM tasks WHERE dialog_id = ? AND msg_id = 10`, int64(111)); p != "media/111/10_a.jpg" {
 		t.Errorf("dst task path = %q, want media/111/10_a.jpg", p)
+	}
+	// the freeze-era columns ride along too: a dropped hash or disk name
+	// would silently undo 1.0.0's dedup basis and naming record on a split
+	if h := queryString(t, ddb, `SELECT file_hash FROM tasks WHERE dialog_id = ? AND msg_id = 10`, int64(111)); h != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+		t.Errorf("dst file_hash of 111/10 = %q, want the seeded sha256", h)
+	}
+	if d := queryString(t, ddb, `SELECT file_name_disk FROM tasks WHERE dialog_id = ? AND msg_id = 11`, int64(111)); d != "b_mp4" {
+		t.Errorf("dst file_name_disk of 111/11 = %q, want b_mp4", d)
 	}
 
 	// media folders moved whole: file and dialog.txt marker intact at dst, gone from src

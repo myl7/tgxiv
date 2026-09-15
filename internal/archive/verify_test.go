@@ -83,3 +83,20 @@ func TestVerifyMissing(t *testing.T) {
 		t.Errorf("expected empty result, got %+v", vr)
 	}
 }
+
+// TestVerifyFindsSanitizedName pins that locally sanitized names stay
+// resolvable: verify anchors on the "<msgID>_" digit prefix, so replacing
+// separators or forbidden characters in a name never moves its file out of
+// the glob's reach — verify itself needed no change for sanitization.
+func TestVerifyFindsSanitizedName(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "42_we_ird_name.mp4", 500)
+
+	vr, err := verify(dir, 42, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !vr.matched || vr.path == "" {
+		t.Errorf("expected the sanitized name to verify, got %+v", vr)
+	}
+}
