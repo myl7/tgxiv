@@ -1,3 +1,12 @@
+# IDE
+.vscode
+.idea
+
+# Agents
+.agents
+.codex
+.claude
+
 # build output
 /tgxiv
 /bin/
